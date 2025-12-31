@@ -242,39 +242,51 @@ export class DLMMBot {
             logger.info('Rebalance', `Approved.`);
         }
 
-        // Simulate Remove
-        const { request: removeReq } = await this.publicClient.simulateContract({
-            address: ROUTER_ADDRESS,
-            abi: ROUTER_ABI,
-            functionName: 'removeLiquidity',
-            args: [
-                this.tokenX,
-                this.tokenY,
-                this.binStep,
-                0n,
-                0n,
-                idsToRemove,
-                amountsToRemove,
-                this.account.address,
-                BigInt(Math.floor(Date.now() / 1000) + 300)
-            ],
-            account: this.account
-        });
+        // Remove with retry
+        await retry(async () => {
+            const { request: removeReq } = await this.publicClient.simulateContract({
+                address: ROUTER_ADDRESS,
+                abi: ROUTER_ABI,
+                functionName: 'removeLiquidity',
+                args: [
+                    this.tokenX,
+                    this.tokenY,
+                    this.binStep,
+                    0n,
+                    0n,
+                    idsToRemove,
+                    amountsToRemove,
+                    this.account.address,
+                    BigInt(Math.floor(Date.now() / 1000) + 300)
+                ],
+                account: this.account
+            });
 
-        const removeHash = await this.walletClient.writeContract(removeReq);
-        await this.publicClient.waitForTransactionReceipt({ hash: removeHash });
-        logger.info('Rebalance', `Liquidity Removed. Hash: ${removeHash}`);
+            const removeHash = await this.walletClient.writeContract(removeReq);
+            const receipt = await this.publicClient.waitForTransactionReceipt({ hash: removeHash });
+
+            if (receipt.status === 'reverted') {
+                throw new Error(`Transaction reverted: ${removeHash}`);
+            }
+
+            logger.info('Rebalance', `Liquidity Removed. Hash: ${removeHash}`);
+        }, 3, 2000);
     }
 
     private async addLiquidity(centerId: number) {
         // Balances
-        const balX = await this.publicClient.readContract({ address: this.tokenX, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address] });
-        const balY = await this.publicClient.readContract({ address: this.tokenY, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address] });
+        let balX = await this.publicClient.readContract({ address: this.tokenX, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address] });
+        let balY = await this.publicClient.readContract({ address: this.tokenY, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address] });
 
         logger.info('Rebalance', `Wallet Balances - X: ${formatUnits(balX, this.tokenXDecimals)}, Y: ${formatUnits(balY, this.tokenYDecimals)}`);
 
+        // Filter dust amounts (< 1000 wei is treated as zero to avoid router revert)
+        const MIN_AMOUNT = 1000n;
+        if (balX < MIN_AMOUNT) balX = 0n;
+        if (balY < MIN_AMOUNT) balY = 0n;
+
         if (balX === 0n && balY === 0n) {
-            logger.warn('Rebalance', `Zero balances. Nothing to add.`);
+            logger.warn('Rebalance', `Zero/dust balances. Nothing to add.`);
             return;
         }
 
@@ -321,7 +333,7 @@ export class DLMMBot {
         };
 
         logger.info('Rebalance', `Simulating Add Liquidity...`);
-        try {
+        await retry(async () => {
             const { request: addReq } = await this.publicClient.simulateContract({
                 address: ROUTER_ADDRESS,
                 abi: ROUTER_ABI,
@@ -332,29 +344,40 @@ export class DLMMBot {
 
             const addHash = await this.walletClient.writeContract(addReq);
             logger.info('Rebalance', `Add Liquidity Sent. Hash: ${addHash}`);
-            await this.publicClient.waitForTransactionReceipt({ hash: addHash });
-            logger.info('Rebalance', `SUCCESS. New Range Centered at: ${centerId}`);
 
-        } catch (simErr: any) {
-            logger.error('Rebalance', `Simulation Failed (Slippage or Logic): ${simErr.message}`);
-        }
+            const receipt = await this.publicClient.waitForTransactionReceipt({ hash: addHash });
+            if (receipt.status === 'reverted') {
+                throw new Error(`Add liquidity reverted: ${addHash}`);
+            }
+
+            logger.info('Rebalance', `SUCCESS. New Range Centered at: ${centerId}`);
+        }, 3, 2000);
     }
 
     private async ensureApprove(token: Address, spender: Address, amount: bigint) {
         if (amount === 0n) return;
+
+        // Check current allowance
         const allowance = await this.publicClient.readContract({
             address: token, abi: ERC20_ABI, functionName: 'allowance', args: [this.account.address, spender]
         });
-        if (allowance < amount) {
-            logger.info('Approve', `Approving ${token}...`);
-            await retry(async () => {
-                const { request } = await this.publicClient.simulateContract({
-                    address: token, abi: ERC20_ABI, functionName: 'approve', args: [spender, amount], account: this.account
-                });
-                const hash = await this.walletClient.writeContract(request);
-                await this.publicClient.waitForTransactionReceipt({ hash });
-                logger.info('Approve', `Approved ${token}`);
-            }, 3, 2000);
+
+        // If already has ANY allowance, skip (we use unlimited so it won't run out)
+        if (allowance > 0n) {
+            logger.info('Approve', `${token} already approved (allowance: ${allowance}). Skipping.`);
+            return;
         }
+
+        // No allowance - approve unlimited
+        const MAX_UINT256 = 2n ** 256n - 1n;
+        logger.info('Approve', `Approving ${token} (unlimited)...`);
+        await retry(async () => {
+            const { request } = await this.publicClient.simulateContract({
+                address: token, abi: ERC20_ABI, functionName: 'approve', args: [spender, MAX_UINT256], account: this.account
+            });
+            const hash = await this.walletClient.writeContract(request);
+            await this.publicClient.waitForTransactionReceipt({ hash });
+            logger.info('Approve', `Approved ${token} (unlimited)`);
+        }, 3, 2000);
     }
 }

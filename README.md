@@ -1,79 +1,81 @@
 # Monad DLMM Rebalancing Bot
 
-This is a personal, high-frequency auto-rebalancing bot for LFJ (Trader Joe) Liquidity Book on Monad Mainnet.
+Auto-rebalancing bot for LFJ (Trader Joe) Liquidity Book on Monad Mainnet.
 
 ## Project Structure
-The project is organized into a modular structure for better maintainability:
-
-```text
+```
 src/
 ├── abis/           # Contract ABIs
-├── config/         # Configuration & Constants (Edit here for Pool/Strategy)
-├── core/           # Main Bot Logic (State & Execution)
+├── config/         # Configuration & Constants
+├── core/           # Main Bot Logic
 ├── utils/          # Helper functions
 └── index.ts        # Entry point
 ```
 
 ## Features
-- **Target**: Specific DLMM Pool (`0xdd...BECE5`).
-- **Strategy**: Fixed range ±0.10% (3 Bins).
-- **Safety**: 
-  - Gas Reserve (5 MON).
-  - Slippage Protection (0.2%).
-  - Hard Out-of-Range Immediate Rebalance.
-  - Simulation before Execution.
+- **Target Pool**: `0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5`
+- **Strategy**: Tight 3-bin range around active price
+- **Event-driven**: Triggers on every new block via `watchBlocks`
+- **Fallback**: 5-minute interval check if block watching fails
+
+## Safety Features
+- Gas Reserve: Keeps 5 MON minimum
+- Slippage Protection: 5 bins tolerance
+- Receipt Validation: Detects on-chain reverts
+- Retry Logic: 3 attempts with exponential backoff
+- Dust Filter: Ignores amounts < 1000 wei
+- Unlimited Approvals: One-time max approval to save gas
 
 ## Prerequisites
 - Node.js >= 18
-- A Monad Wallet with:
-  - MON for gas (keeps 5 MON reserve).
-  - Tokens for the pool.
+- MON for gas (minimum 5 MON reserve)
+- Pool tokens (WMON/AUSD or relevant pair)
 
-## Setup Instructions
+## Setup
 
-### 1. Install Dependencies
+### 1. Install
 ```bash
 npm install
 ```
 
-### 2. Configure Environment
-1. Copy the example file:
-   ```bash
-   cp .env.example .env
-   ```
-   *(Or on Windows Copy-Paste `.env.example` to `.env`)*
+### 2. Configure
+```bash
+cp .env.example .env
+```
 
-2. Edit `.env` and add your **Private Key**:
-   ```
-   PRIVATE_KEY=your_private_key_without_0x
-   RPC_URL=https://rpc.monad.xyz
-   ```
+Edit `.env`:
+```
+PRIVATE_KEY=your_private_key_without_0x
+RPC_URL=https://rpc.monad.xyz
+```
 
-### 3. Fund Your Wallet
-Ensure you have:
-- At least **5 MON** + Gas money.
-- Tokens (TokenX/TokenY) for the pool.
+### 3. Fund Wallet
+- At least 5 MON for gas
+- Pool tokens to provide liquidity
 
-### 4. Run Verification
-**Safety Check**: The bot runs a 5 MON balance check immediately on start. If you have < 5 MON, it exits.
-
-### 5. Start the Bot
+### 4. Run
 ```bash
 npm start
 ```
-(Executes `src/index.ts`)
 
 ## Configuration
-To change pool settings, strategy thresholds, or network details, edit:
-**`src/config/index.ts`**
+Edit `src/config/index.ts` to change:
+- Pool/Router addresses
+- Strategy thresholds
+- Network settings
 
 ## Logs
-The bot logs important events:
-- `[Init]`: Startup info.
-- `[Health]`: Balance checks.
-- `[Watcher]`: Block scanning.
-- `[Trigger]`: Rebalance reason.
-- `[Rebalance]`: Execution details.
+- `[Init]` - Startup info
+- `[Entry]` - Initial entry check
+- `[Watcher]` - Block scanning
+- `[Trigger]` - Rebalance reason
+- `[Rebalance]` - Execution details
+- `[Approve]` - Token approvals
+- `[Retry]` - Failed operation retries
+
+## Rebalance Triggers
+- **Hard Out-of-Range**: Active bin moves > 1 bin from center
+- Price or fee thresholds (configurable)
 
 ## Disclaimer
-Use at your own risk. This bot handles private keys and executes transactions automatically.
+⚠️ Use at your own risk. This bot handles private keys and executes real transactions.
