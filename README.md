@@ -69,8 +69,14 @@ npm install -g pm2
 
 ### Start with PM2
 ```bash
+# Basic start
 pm2 start npm --name "dlmm-bot" -- start
+
+# With auto-restart every 24 hours (recommended)
+pm2 start npm --name "dlmm-bot" --cron-restart="0 0 * * *" -- start
 ```
+
+**Note**: The cron pattern `0 0 * * *` restarts the bot at midnight (00:00) every day.
 
 ### Useful Commands
 ```bash
