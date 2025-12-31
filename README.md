@@ -58,6 +58,35 @@ RPC_URL=https://rpc.monad.xyz
 npm start
 ```
 
+## Production (PM2)
+
+PM2 keeps the bot running 24/7 with auto-restart on crashes.
+
+### Install PM2
+```bash
+npm install -g pm2
+```
+
+### Start with PM2
+```bash
+pm2 start npm --name "dlmm-bot" -- start
+```
+
+### Useful Commands
+```bash
+pm2 logs dlmm-bot      # View logs
+pm2 status             # Check status
+pm2 restart dlmm-bot   # Restart bot
+pm2 stop dlmm-bot      # Stop bot
+pm2 delete dlmm-bot    # Remove from PM2
+```
+
+### Auto-start on System Boot
+```bash
+pm2 startup            # Generate startup script
+pm2 save               # Save current process list
+```
+
 ## Configuration
 Edit `src/config/index.ts` to change:
 - Pool/Router addresses
