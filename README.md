@@ -17,6 +17,9 @@ src/
 - **Strategy**: Tight 3-bin range around active price
 - **Event-driven**: Triggers on every new block via `watchBlocks`
 - **Fallback**: 5-minute interval check if block watching fails
+- **Time-based Rebalancing**: Automatic maintenance rebalance after 1 minute of continuous IN-RANGE state
+- **Native Token Support**: Uses `addLiquidityNATIVE` and `removeLiquidityNATIVE` for gas-efficient native token handling
+- **Liquidity Reserve**: Uses 90% of balance for liquidity, reserves 10% in wallet
 
 ## Safety Features
 - Gas Reserve: Keeps 5 MON minimum
@@ -25,6 +28,7 @@ src/
 - Retry Logic: 3 attempts with exponential backoff
 - Dust Filter: Ignores amounts < 1000 wei
 - Unlimited Approvals: One-time max approval to save gas
+- Mutex Lock: Ensures only one rebalance operation runs at a time
 
 ## Prerequisites
 - Node.js >= 18
@@ -98,19 +102,44 @@ Edit `src/config/index.ts` to change:
 - Pool/Router addresses
 - Strategy thresholds
 - Network settings
+- Gas reserve minimum
+
+Edit `src/core/Bot.ts` to change:
+- Maintenance rebalance interval (default: 1 minute)
+- Liquidity usage percentage (default: 90%)
 
 ## Logs
-- `[Init]` - Startup info
+- `[Init]` - Startup info and pool initialization
 - `[Entry]` - Initial entry check
 - `[Watcher]` - Block scanning
+- `[Range]` - IN-RANGE/OUT-OF-RANGE state tracking
+- `[Timer]` - Maintenance timer status
 - `[Trigger]` - Rebalance reason
-- `[Rebalance]` - Execution details
+- `[Rebalance]` - Execution details (Standard or Maintenance)
+- `[Maintenance]` - Maintenance rebalance operations
 - `[Approve]` - Token approvals
 - `[Retry]` - Failed operation retries
 
 ## Rebalance Triggers
-- **Hard Out-of-Range**: Active bin moves > 1 bin from center
-- Price or fee thresholds (configurable)
+
+### OUT-OF-RANGE (Priority)
+- **Immediate Rebalance**: If the active bin exits the current 3-bin range `[centerBin - 1, centerBin, centerBin + 1]`
+  - Removes all liquidity immediately
+  - Re-adds liquidity centered on the new active bin
+
+### IN-RANGE
+- **Maintenance Rebalance**: If position remains fully IN-RANGE for more than 1 minute
+  - Removes all liquidity
+  - Re-adds liquidity to the same 3-bin range
+  - Compounds accrued fees
+  - Timer is cancelled if position goes OUT-OF-RANGE before completion
+
+## Liquidity Distribution
+- **3-Bin Range**: `[activeId - 1, activeId, activeId + 1]`
+- **Token X**: Distributed evenly (50% each) to `activeId` and `activeId + 1`
+- **Token Y**: Distributed evenly (50% each) to `activeId - 1` and `activeId`
+- **Active Bin**: Receives 50% of both tokens (if both exist)
+- **Total Usage**: 90% of wallet balance (10% reserved in wallet)
 
 ## Disclaimer
 ⚠️ Use at your own risk. This bot handles private keys and executes real transactions.

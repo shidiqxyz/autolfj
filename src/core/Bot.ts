@@ -34,7 +34,7 @@ export class DLMMBot {
     private inRangeStartTime: number | null = null; // Timestamp when position entered IN-RANGE state
     private outOfRangeStartTime: number | null = null; // Timestamp when position entered OUT-OF-RANGE state
     private inRangeTimer: NodeJS.Timeout | null = null; // Timer for 3-minute maintenance rebalance
-    private readonly MAINTENANCE_REBALANCE_INTERVAL_MS = 1.5 * 60 * 1000; // 1.5 minutes
+    private readonly MAINTENANCE_REBALANCE_INTERVAL_MS = 1 * 60 * 1000; // 1 minutes
 
     // Pool Info
     private tokenX!: Address;
@@ -44,6 +44,7 @@ export class DLMMBot {
     private tokenYDecimals!: number;
     private tokenXSymbol!: string;
     private tokenYSymbol!: string;
+    private isTokenXNative!: boolean; // true if tokenX is WMON (wrapped native), false if tokenY is
 
     constructor() {
         this.publicClient = createPublicClient({
@@ -147,11 +148,23 @@ export class DLMMBot {
         this.tokenXSymbol = await this.publicClient.readContract({ address: this.tokenX, abi: ERC20_ABI, functionName: 'symbol' });
         this.tokenYSymbol = await this.publicClient.readContract({ address: this.tokenY, abi: ERC20_ABI, functionName: 'symbol' });
 
+        // Detect which token is the wrapped native (WMON)
+        this.isTokenXNative = this.tokenXSymbol.toUpperCase() === 'WMON' || this.tokenXSymbol.toUpperCase() === 'WNATIVE';
+        const isTokenYNative = this.tokenYSymbol.toUpperCase() === 'WMON' || this.tokenYSymbol.toUpperCase() === 'WNATIVE';
+
+        if (!this.isTokenXNative && !isTokenYNative) {
+            logger.warn('Init', 'Warning: Neither token appears to be wrapped native. Assuming tokenX is native.');
+            this.isTokenXNative = true; // Default assumption
+        } else if (isTokenYNative && !this.isTokenXNative) {
+            logger.warn('Init', 'Warning: tokenY is native but NATIVE functions expect tokenX to be native. This may cause issues.');
+        }
+
         const activeId = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getActiveId' });
         this.lastActiveBin = activeId;
         // currentCenterBin will be set after ensureEntry() determines if we have existing liquidity
 
         logger.info('Init', `Connected. TokenX: ${this.tokenXSymbol} (${this.tokenX}), TokenY: ${this.tokenYSymbol} (${this.tokenY})`);
+        logger.info('Init', `Native token: ${this.isTokenXNative ? this.tokenXSymbol : this.tokenYSymbol}`);
         logger.info('Init', `Bin Step: ${this.binStep}, Active Bin: ${activeId}`);
     }
 
@@ -218,10 +231,10 @@ export class DLMMBot {
         // Cancel any existing timer first
         this.cancelInRangeTimer();
 
-        logger.info('Timer', 'Starting 3-minute in-range maintenance timer');
+        logger.info('Timer', 'Starting 1-minute in-range maintenance timer');
         this.inRangeTimer = setTimeout(async () => {
             if (!this.isRebalancing) {
-                logger.info('Timer', '3-minute in-range timer expired. Performing maintenance rebalance...');
+                logger.info('Timer', '1-minute in-range timer expired. Performing maintenance rebalance...');
                 await this.executeMaintenanceRebalance();
             }
         }, this.MAINTENANCE_REBALANCE_INTERVAL_MS);
@@ -385,18 +398,20 @@ export class DLMMBot {
             logger.info('Rebalance', `Approved.`);
         }
 
-        // Remove with retry
+        // Remove with retry using removeLiquidityNATIVE
         await retry(async () => {
+            // Determine which token is non-native (the one that's not WMON)
+            const nonNativeToken = this.isTokenXNative ? this.tokenY : this.tokenX;
+
             const { request: removeReq } = await this.publicClient.simulateContract({
                 address: ROUTER_ADDRESS,
                 abi: ROUTER_ABI,
-                functionName: 'removeLiquidity',
+                functionName: 'removeLiquidityNATIVE',
                 args: [
-                    this.tokenX,
-                    this.tokenY,
+                    nonNativeToken,
                     this.binStep,
-                    0n,
-                    0n,
+                    0n, // amountTokenMin
+                    0n, // amountNATIVEMin
                     idsToRemove,
                     amountsToRemove,
                     this.account.address,
@@ -412,19 +427,33 @@ export class DLMMBot {
                 throw new Error(`Transaction reverted: ${removeHash}`);
             }
 
-            logger.info('Rebalance', `Liquidity Removed. Hash: ${removeHash}`);
+            logger.info('Rebalance', `Liquidity Removed (NATIVE). Hash: ${removeHash}`);
         }, 3, 2000);
     }
 
 
     private async addLiquidity(centerId: number) {
         // Step 1: Get fresh balances
-        let balX = await this.publicClient.readContract({
-            address: this.tokenX, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
-        });
-        let balY = await this.publicClient.readContract({
-            address: this.tokenY, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
-        });
+        // For native token, get native balance (MON), for non-native get ERC20 balance
+        let balX: bigint;
+        let balY: bigint;
+
+        if (this.isTokenXNative) {
+            // tokenX is native (WMON), get native balance
+            const nativeBalance = await this.publicClient.getBalance({ address: this.account.address });
+            balX = nativeBalance;
+            // Get non-native token balance
+            balY = await this.publicClient.readContract({
+                address: this.tokenY, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
+            });
+        } else {
+            // tokenY is native (WMON), get native balance
+            const nativeBalance = await this.publicClient.getBalance({ address: this.account.address });
+            balX = await this.publicClient.readContract({
+                address: this.tokenX, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
+            });
+            balY = nativeBalance;
+        }
 
         logger.info('Rebalance', `Wallet Balances - X: ${formatUnits(balX, this.tokenXDecimals)}, Y: ${formatUnits(balY, this.tokenYDecimals)}`);
 
@@ -438,9 +467,25 @@ export class DLMMBot {
             return;
         }
 
-        // Step 3: Ensure approvals
-        await this.ensureApprove(this.tokenX, ROUTER_ADDRESS, balX);
-        await this.ensureApprove(this.tokenY, ROUTER_ADDRESS, balY);
+        // Step 2.5: Use only 90% of X balance for liquidity (reserve 10%), but use 100% of Y balance
+        const LIQUIDITY_PERCENTAGE = 90n; // 90%
+        const PERCENTAGE_DIVISOR = 100n;
+        if (balX > 0n) {
+            balX = (balX * LIQUIDITY_PERCENTAGE) / PERCENTAGE_DIVISOR;
+            logger.info('Rebalance', `Using 90% of X balance: ${formatUnits(balX, this.tokenXDecimals)} (10% reserved)`);
+        }
+        // Y balance uses 100% (no reserve)
+        logger.info('Rebalance', `Using 100% of Y balance: ${formatUnits(balY, this.tokenYDecimals)} (no reserve)`);
+
+        // Step 3: Ensure approvals (only for non-native token)
+        // For native token, we send it as msg.value, no approval needed
+        if (this.isTokenXNative) {
+            // Only approve tokenY (non-native)
+            await this.ensureApprove(this.tokenY, ROUTER_ADDRESS, balY);
+        } else {
+            // Only approve tokenX (non-native)
+            await this.ensureApprove(this.tokenX, ROUTER_ADDRESS, balX);
+        }
 
         // Step 4: CRITICAL - Fetch FRESH activeId from chain
         const freshActiveId = await this.publicClient.readContract({
@@ -451,6 +496,17 @@ export class DLMMBot {
 
         logger.info('Rebalance', `Fresh ActiveId from chain: ${freshActiveId} (requested: ${centerId})`);
 
+        // Step 4.5: Reserve gas for native token before building params
+        const GAS_RESERVE_WEI = BigInt(Math.floor(STRATEGY.MIN_GAS_RESERVE_MON * 1e18));
+        if (this.isTokenXNative && balX > GAS_RESERVE_WEI) {
+            balX = balX - GAS_RESERVE_WEI;
+        } else if (!this.isTokenXNative && balY > GAS_RESERVE_WEI) {
+            balY = balY - GAS_RESERVE_WEI;
+        } else if ((this.isTokenXNative && balX > 0n) || (!this.isTokenXNative && balY > 0n)) {
+            logger.warn('Rebalance', 'Insufficient native token after gas reserve. Cannot add liquidity.');
+            return;
+        }
+
         // Step 5: Build DLMM-safe liquidity params
         const params = this.buildSafeLiquidityParams(freshActiveId, balX, balY);
 
@@ -459,19 +515,28 @@ export class DLMMBot {
             return;
         }
 
-        // Step 6: Simulate & Send with retry
-        logger.info('Rebalance', `Simulating Add Liquidity...`);
+        // Step 6: Simulate & Send with retry using addLiquidityNATIVE
+        // Calculate native token amount to send (msg.value)
+        const nativeAmount = this.isTokenXNative ? balX : balY;
+
+        logger.info('Rebalance', `Simulating Add Liquidity (NATIVE)...`);
+        logger.info('Rebalance', `Sending ${formatUnits(nativeAmount, 18)} native tokens as msg.value (reserved ${STRATEGY.MIN_GAS_RESERVE_MON} MON for gas)`);
+
         await retry(async () => {
             const { request: addReq } = await this.publicClient.simulateContract({
                 address: ROUTER_ADDRESS,
                 abi: ROUTER_ABI,
-                functionName: 'addLiquidity',
+                functionName: 'addLiquidityNATIVE',
                 args: [params],
-                account: this.account
+                account: this.account,
+                value: nativeAmount
             });
 
-            const addHash = await this.walletClient.writeContract(addReq);
-            logger.info('Rebalance', `Add Liquidity Sent. Hash: ${addHash}`);
+            const addHash = await this.walletClient.writeContract({
+                ...addReq,
+                value: nativeAmount
+            });
+            logger.info('Rebalance', `Add Liquidity (NATIVE) Sent. Hash: ${addHash}`);
 
             const receipt = await this.publicClient.waitForTransactionReceipt({ hash: addHash });
             if (receipt.status === 'reverted') {
