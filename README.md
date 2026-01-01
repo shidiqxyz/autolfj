@@ -1,6 +1,6 @@
-# Monad DLMM Rebalancing Bot
+# Monad DLMM Spam Bot
 
-Auto-rebalancing bot for LFJ (Trader Joe) Liquidity Book on Monad Mainnet.
+Automated liquidity "spam" bot for LFJ (Trader Joe) Liquidity Book on Monad Mainnet. This bot repeatedly adds and removes liquidity to generate activity.
 
 ## Project Structure
 ```
@@ -9,32 +9,31 @@ src/
 ├── config/         # Configuration & Constants
 ├── core/           # Main Bot Logic
 ├── utils/          # Helper functions
-└── index.ts        # Entry point
+12: └── index.ts        # Entry point
 ```
 
 ## Features
-- **Target Pool**: `0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5`
-- **Strategy**: Tight 3-bin range around active price
-- **Event-driven**: Triggers on every new block via `watchBlocks`
-- **Fallback**: 5-minute interval check if block watching fails
-- **Time-based Rebalancing**: Automatic maintenance rebalance after 1 minute of continuous IN-RANGE state
-- **Native Token Support**: Uses `addLiquidityNATIVE` and `removeLiquidityNATIVE` for gas-efficient native token handling
-- **Liquidity Reserve**: Uses 90% of balance for liquidity, reserves 10% in wallet
+- **Target Pool**: `0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5` (MON/AUSD)
+- **Strategy**: Cyclic Add/Remove in a 2-bin range `[activeId, activeId + 1]`
+- **Cycle-based**: 
+  1. Adds liquidity
+  2. Waits (random delay)
+  3. Removes liquidity
+  4. Waits (random delay)
+  5. Repeats
+- **Native Token Support**: Uses `addLiquidityNATIVE` and `removeLiquidityNATIVE`
+- **Liquidity Usage**: Uses 95% of usable balance per cycle
 
 ## Safety Features
-- Gas Reserve: Reserves 10 MON for gas fees in every `addLiquidityNATIVE` operation
-- Safety Stop: Bot stops automatically if balance falls below 1 MON
-- Slippage Protection: 5 bins tolerance
-- Receipt Validation: Detects on-chain reverts
-- Retry Logic: 3 attempts with exponential backoff
-- Dust Filter: Ignores amounts < 1000 wei
-- Unlimited Approvals: One-time max approval to save gas
-- Mutex Lock: Ensures only one rebalance operation runs at a time
+- **Gas Reserve**: Reserves 10 MON for gas fees
+- **Safety Stop**: Stops automatically if balance falls below 1 MON
+- **Slippage Protection**: 5 bins tolerance
+- **Retry Logic**: 3 attempts with exponential backoff for transactions
 
 ## Prerequisites
 - Node.js >= 18
-- MON for gas (minimum 10 MON reserve for `addLiquidityNATIVE` operations)
-- Pool tokens (WMON/AUSD or relevant pair)
+- MON for gas and liquidity
+- AUSD (optional, bot handles single-sided MON if needed, but intended for mixed usage if available)
 
 ## Setup
 
@@ -54,19 +53,12 @@ PRIVATE_KEY=your_private_key_without_0x
 RPC_URL=https://rpc.monad.xyz
 ```
 
-### 3. Fund Wallet
-- At least 10 MON for gas (reserved for `addLiquidityNATIVE` operations)
-- Pool tokens to provide liquidity
-- **Note**: Bot will stop if balance falls below 1 MON for safety
-
-### 4. Run
+### 3. Run
 ```bash
 npm start
 ```
 
 ## Production (PM2)
-
-PM2 keeps the bot running 24/7 with auto-restart on crashes.
 
 ### Install PM2
 ```bash
@@ -78,71 +70,37 @@ npm install -g pm2
 # Basic start
 pm2 start npm --name "dlmm-bot" -- start
 
-# With auto-restart every 24 hours (recommended)
+# With auto-restart (recommended)
 pm2 start npm --name "dlmm-bot" --cron-restart="0 0 * * *" -- start
-```
-
-**Note**: The cron pattern `0 0 * * *` restarts the bot at midnight (00:00) every day.
-
-### Useful Commands
-```bash
-pm2 logs dlmm-bot      # View logs
-pm2 status             # Check status
-pm2 restart dlmm-bot   # Restart bot
-pm2 stop dlmm-bot      # Stop bot
-pm2 delete dlmm-bot    # Remove from PM2
-```
-
-### Auto-start on System Boot
-```bash
-pm2 startup            # Generate startup script
-pm2 save               # Save current process list
 ```
 
 ## Configuration
 Edit `src/config/index.ts` to change:
-- Pool/Router addresses
-- Strategy thresholds
-- Network settings
-- Gas reserve minimum (default: 10 MON for `addLiquidityNATIVE`)
-- Minimum safe balance (default: 1 MON - bot stops if below this)
-
-Edit `src/core/Bot.ts` to change:
-- Maintenance rebalance interval (default: 1 minute)
-- Liquidity usage percentage (default: 90%)
+- `STRATEGY` settings:
+    - `LIQUIDITY_USE_PERCENT`: Percentage of balance to use (Default: 0.95 for 95%)
+    - `DELAY_AFTER_ADD_MIN/MAX`: Time to hold position (Default: 10-90s)
+    - `DELAY_AFTER_REMOVE_MIN/MAX`: Time to wait before next cycle (Default: 5-30s)
+    - `MIN_GAS_RESERVE_MON`: Amount to keep for gas (Default: 10 MON)
 
 ## Logs
-- `[Init]` - Startup info and pool initialization
-- `[Entry]` - Initial entry check
-- `[Watcher]` - Block scanning
-- `[Range]` - IN-RANGE/OUT-OF-RANGE state tracking
-- `[Timer]` - Maintenance timer status
-- `[Trigger]` - Rebalance reason
-- `[Rebalance]` - Execution details (Standard or Maintenance)
-- `[Maintenance]` - Maintenance rebalance operations
-- `[Approve]` - Token approvals
-- `[Retry]` - Failed operation retries
-
-## Rebalance Triggers
-
-### OUT-OF-RANGE (Priority)
-- **Immediate Rebalance**: If the active bin exits the current 3-bin range `[centerBin - 1, centerBin, centerBin + 1]`
-  - Removes all liquidity immediately
-  - Re-adds liquidity centered on the new active bin
-
-### IN-RANGE
-- **Maintenance Rebalance**: If position remains fully IN-RANGE for more than 1 minute
-  - Removes all liquidity
-  - Re-adds liquidity to the same 3-bin range
-  - Compounds accrued fees
-  - Timer is cancelled if position goes OUT-OF-RANGE before completion
+- `[Init]` - Startup info
+- `[Cycle]` - Cycle start/end summary
+- `[Balance]` - Balance checks
+- `[Liquidity]` - Calculation of amounts to add
+- `[Pool]` - Active bin tracking
+- `[Add]` - Add liquidity operations
+- `[Remove]` - Remove liquidity operations
+- `[Delay]` - Waiting periods
+- `[Error]` - Error reporting
 
 ## Liquidity Distribution
-- **3-Bin Range**: `[activeId - 1, activeId, activeId + 1]`
-- **Token X**: Distributed evenly (50% each) to `activeId` and `activeId + 1`
-- **Token Y**: Distributed evenly (50% each) to `activeId - 1` and `activeId`
-- **Active Bin**: Receives 50% of both tokens (if both exist)
-- **Total Usage**: 90% of wallet balance (10% reserved in wallet)
+- **2-Bin Range**: `[activeId, activeId + 1]`
+- **Distribution**:
+    - **Token X (MON)**: Split 50/50 between `activeId` and `activeId + 1`
+    - **Token Y (AUSD)**: 
+        - If `activeId` is the first bin: 100% to `activeId`
+        - If `activeId` is the second bin: 100% to `activeId`
+        - Typically aims effectively for `activeId` for AUSD.
 
 ## Disclaimer
 ⚠️ Use at your own risk. This bot handles private keys and executes real transactions.
