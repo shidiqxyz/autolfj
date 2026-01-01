@@ -1,4 +1,3 @@
-
 import {
     PublicClient,
     WalletClient,
@@ -193,16 +192,17 @@ export class DLMMBot {
         this.tokenXSymbol = tokenXSymbol;
         this.tokenYSymbol = tokenYSymbol;
 
-        // Detect which token is the wrapped native (WMON)
-        this.isTokenXNative = this.tokenXSymbol.toUpperCase() === 'WMON' || this.tokenXSymbol.toUpperCase() === 'WNATIVE';
-        const isTokenYNative = this.tokenYSymbol.toUpperCase() === 'WMON' || this.tokenYSymbol.toUpperCase() === 'WNATIVE';
+    // Detect which token is the wrapped native (WMON)
+    this.isTokenXNative = this.tokenXSymbol.toUpperCase() === 'WMON' || this.tokenXSymbol.toUpperCase() === 'WNATIVE';
+    const isTokenYNative = this.tokenYSymbol.toUpperCase() === 'WMON' || this.tokenYSymbol.toUpperCase() === 'WNATIVE';
 
-        if (!this.isTokenXNative && !isTokenYNative) {
-            logger.warn('Init', 'Warning: Neither token appears to be wrapped native. Assuming tokenX is native.');
-            this.isTokenXNative = true; // Default assumption
-        } else if (isTokenYNative && !this.isTokenXNative) {
-            logger.warn('Init', 'Warning: tokenY is native but NATIVE functions expect tokenX to be native. This may cause issues.');
-        }
+    if (!this.isTokenXNative && !isTokenYNative) {
+        logger.warn('Init', 'Warning: Neither token appears to be wrapped native. Assuming tokenX is native.');
+        this.isTokenXNative = true; // Default assumption
+    } else if (isTokenYNative && !this.isTokenXNative) {
+        logger.warn('Init', 'Warning: tokenY is native but NATIVE functions expect tokenX to be native. This may cause issues.');
+    }
+
 
         // currentCenterBin will be set after ensureEntry() determines if we have existing liquidity
 
@@ -559,15 +559,25 @@ export class DLMMBot {
             return;
         }
 
-        // Step 2.5: Use only 90% of X balance for liquidity (reserve 10%), but use 100% of Y balance
-        const LIQUIDITY_PERCENTAGE = 95n; // 90%
+        // Step 2.5: Use 100% of X balance, reserve 10% of Y balance
+        const RESERVE_PERCENTAGE = 90n; // use 90%, reserve 10%
         const PERCENTAGE_DIVISOR = 100n;
-        if (balX > 0n) {
-            balX = (balX * LIQUIDITY_PERCENTAGE) / PERCENTAGE_DIVISOR;
-            logger.info('Rebalance', `Using 95% of X balance: ${formatUnits(balX, this.tokenXDecimals)} (5% reserved)`);
+
+        // X balance uses 100% (no reserve)
+        logger.info(
+            'Rebalance',
+            `Using 100% of X balance: ${formatUnits(balX, this.tokenXDecimals)} (no reserve)`
+        );
+
+        // Y balance uses 90% (reserve 10%)
+        if (balY > 0n) {
+            balY = (balY * RESERVE_PERCENTAGE) / PERCENTAGE_DIVISOR;
+            logger.info(
+                'Rebalance',
+                `Using 90% of Y balance: ${formatUnits(balY, this.tokenYDecimals)} (10% reserved)`
+            );
         }
-        // Y balance uses 100% (no reserve)
-        logger.info('Rebalance', `Using 100% of Y balance: ${formatUnits(balY, this.tokenYDecimals)} (no reserve)`);
+
 
         // Step 3: Ensure approvals (only for non-native token)
         // For native token, we send it as msg.value, no approval needed
@@ -594,10 +604,20 @@ export class DLMMBot {
             balX = balX - GAS_RESERVE_WEI;
         } else if (!this.isTokenXNative && balY > GAS_RESERVE_WEI) {
             balY = balY - GAS_RESERVE_WEI;
-        } else if ((this.isTokenXNative && balX > 0n) || (!this.isTokenXNative && balY > 0n)) {
-            logger.warn('Rebalance', 'Insufficient native token after gas reserve. Cannot add liquidity.');
-            return;
+        } else {
+            logger.warn(
+                'Rebalance',
+                'Native balance too low after gas reserve. Skipping native contribution, but continuing bot.'
+            );
+        
+            // Clamp native balance to zero instead of aborting
+            if (this.isTokenXNative) {
+                balX = 0n;
+            } else {
+                balY = 0n;
+            }
         }
+        
 
         // Step 5: Build DLMM-safe liquidity params
         const params = this.buildSafeLiquidityParams(freshActiveId, balX, balY);
