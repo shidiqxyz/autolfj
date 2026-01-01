@@ -3,6 +3,12 @@ export async function sleep(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+export function randomDelay(minSeconds: number, maxSeconds: number): number {
+    const minMs = minSeconds * 1000;
+    const maxMs = maxSeconds * 1000;
+    return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+}
+
 export async function retry<T>(fn: () => Promise<T>, retries = 3, delay = 2000): Promise<T> {
     try {
         return await fn();
