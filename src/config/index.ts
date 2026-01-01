@@ -10,7 +10,8 @@ export const PRIVATE_KEY = process.env.PRIVATE_KEY as Hex;
 export const CHAIN_ID = 143; // Monad Mainnet
 
 // CONTRACT ADDRESSES
-export const POOL_ADDRESS = '0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5' as Address;
+//WETH
+export const POOL_ADDRESS = '0x0594c7505A667933c7d8CB1064BcA58A2211a3be' as Address;
 export const ROUTER_ADDRESS = '0x18556DA13313f3532c54711497A8FedAC273220E' as Address;
 
 // Gas price settings (higher = faster inclusion = less retries)
