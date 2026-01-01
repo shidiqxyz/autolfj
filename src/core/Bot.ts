@@ -15,7 +15,8 @@ import {
     STRATEGY,
     RPC_URL,
     PRIVATE_KEY,
-    CHAIN_ID
+    CHAIN_ID,
+    GAS_SETTINGS
 } from '../config';
 import { ERC20_ABI, PAIR_ABI, ROUTER_ABI } from '../abis';
 import { retry, sleep, logger } from '../utils';
@@ -29,6 +30,7 @@ export class DLMMBot {
     private isRebalancing = false;
     private lastActiveBin = 0;
     private currentCenterBin = 0; // Center bin of current 3-bin range [center-1, center, center+1]
+    private isApproved = false; // Cache approval status to avoid redundant checks
 
     // Time-based range tracking
     private inRangeStartTime: number | null = null; // Timestamp when position entered IN-RANGE state
@@ -91,15 +93,27 @@ export class DLMMBot {
         let hasLiquidity = false;
 
         // Check small range around active to see if we are already in
+        // OPTIMIZATION: Use multicall for batch reads
         const rangeCheck = 5;
+        const binIds: bigint[] = [];
         for (let i = activeId - rangeCheck; i <= activeId + rangeCheck; i++) {
-            const b = await this.publicClient.readContract({
-                address: POOL_ADDRESS,
-                abi: PAIR_ABI,
-                functionName: 'balanceOf',
-                args: [this.account.address, BigInt(i)]
-            });
-            if (b > 0n) {
+            binIds.push(BigInt(i));
+        }
+
+        const balanceCalls = binIds.map(id => ({
+            address: POOL_ADDRESS as Address,
+            abi: PAIR_ABI,
+            functionName: 'balanceOf' as const,
+            args: [this.account.address, id] as const
+        }));
+
+        const balances = await Promise.allSettled(
+            balanceCalls.map(call => this.publicClient.readContract(call))
+        );
+
+        // Check if any balance > 0
+        for (const result of balances) {
+            if (result.status === 'fulfilled' && result.value > 0n) {
                 hasLiquidity = true;
                 break;
             }
@@ -112,14 +126,9 @@ export class DLMMBot {
             logger.info('Entry', 'Liquidity found. Determining current center bin...');
             // Find the center bin of existing liquidity
             let foundCenterBin = 0;
-            for (let i = activeId - rangeCheck; i <= activeId + rangeCheck; i++) {
-                const b = await this.publicClient.readContract({
-                    address: POOL_ADDRESS,
-                    abi: PAIR_ABI,
-                    functionName: 'balanceOf',
-                    args: [this.account.address, BigInt(i)]
-                });
-                if (b > 0n) {
+            for (let i = 0; i < balances.length; i++) {
+                const result = balances[i];
+                if (result.status === 'fulfilled' && result.value > 0n) {
                     // Assume the center is near the active bin
                     foundCenterBin = activeId;
                     break;
@@ -139,14 +148,35 @@ export class DLMMBot {
     }
 
     private async initializePoolData() {
-        this.tokenX = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getTokenX' });
-        this.tokenY = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getTokenY' });
-        this.binStep = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getBinStep' });
+        // OPTIMIZATION: Batch all initialization reads using parallel readContract calls
+        const [tokenX, tokenY, binStep, activeId] = await Promise.all([
+            this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getTokenX' }),
+            this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getTokenY' }),
+            this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getBinStep' }),
+            this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getActiveId' })
+        ]);
 
-        this.tokenXDecimals = await this.publicClient.readContract({ address: this.tokenX, abi: ERC20_ABI, functionName: 'decimals' });
-        this.tokenYDecimals = await this.publicClient.readContract({ address: this.tokenY, abi: ERC20_ABI, functionName: 'decimals' });
-        this.tokenXSymbol = await this.publicClient.readContract({ address: this.tokenX, abi: ERC20_ABI, functionName: 'symbol' });
-        this.tokenYSymbol = await this.publicClient.readContract({ address: this.tokenY, abi: ERC20_ABI, functionName: 'symbol' });
+        if (!tokenX || !tokenY || binStep === undefined || activeId === undefined) {
+            throw new Error('Failed to initialize pool data');
+        }
+
+        this.tokenX = tokenX as Address;
+        this.tokenY = tokenY as Address;
+        this.binStep = binStep as number;
+        this.lastActiveBin = activeId as number;
+
+        // OPTIMIZATION: Batch token metadata reads in parallel
+        const [tokenXDecimals, tokenYDecimals, tokenXSymbol, tokenYSymbol] = await Promise.all([
+            this.publicClient.readContract({ address: this.tokenX, abi: ERC20_ABI, functionName: 'decimals' }),
+            this.publicClient.readContract({ address: this.tokenY, abi: ERC20_ABI, functionName: 'decimals' }),
+            this.publicClient.readContract({ address: this.tokenX, abi: ERC20_ABI, functionName: 'symbol' }),
+            this.publicClient.readContract({ address: this.tokenY, abi: ERC20_ABI, functionName: 'symbol' })
+        ]);
+
+        this.tokenXDecimals = tokenXDecimals;
+        this.tokenYDecimals = tokenYDecimals;
+        this.tokenXSymbol = tokenXSymbol;
+        this.tokenYSymbol = tokenYSymbol;
 
         // Detect which token is the wrapped native (WMON)
         this.isTokenXNative = this.tokenXSymbol.toUpperCase() === 'WMON' || this.tokenXSymbol.toUpperCase() === 'WNATIVE';
@@ -159,13 +189,11 @@ export class DLMMBot {
             logger.warn('Init', 'Warning: tokenY is native but NATIVE functions expect tokenX to be native. This may cause issues.');
         }
 
-        const activeId = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getActiveId' });
-        this.lastActiveBin = activeId;
         // currentCenterBin will be set after ensureEntry() determines if we have existing liquidity
 
         logger.info('Init', `Connected. TokenX: ${this.tokenXSymbol} (${this.tokenX}), TokenY: ${this.tokenYSymbol} (${this.tokenY})`);
         logger.info('Init', `Native token: ${this.isTokenXNative ? this.tokenXSymbol : this.tokenYSymbol}`);
-        logger.info('Init', `Bin Step: ${this.binStep}, Active Bin: ${activeId}`);
+        logger.info('Init', `Bin Step: ${this.binStep}, Active Bin: ${this.lastActiveBin}`);
     }
 
     private async checkHealth() {
@@ -242,6 +270,7 @@ export class DLMMBot {
 
     private async checkRebalance() {
         try {
+            // OPTIMIZATION: Cache activeId to avoid re-reading in addLiquidity
             const activeId = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getActiveId' });
             const isInRange = this.isPositionInRange(activeId);
 
@@ -265,7 +294,7 @@ export class DLMMBot {
 
                 if (hasExitedRange && this.currentCenterBin !== 0) {
                     logger.warn('Trigger', `Active bin (${activeId}) exited 3-bin range [${this.currentCenterBin - 1}, ${this.currentCenterBin}, ${this.currentCenterBin + 1}]. Immediate rebalance required.`);
-                    await this.executeRebalance(activeId);
+                    await this.executeRebalance(activeId, false, activeId);
                     return;
                 }
             } else {
@@ -310,10 +339,12 @@ export class DLMMBot {
         }
 
         logger.info('Maintenance', `Starting maintenance rebalance (same range: ${this.currentCenterBin})`);
-        await this.executeRebalance(this.currentCenterBin, true);
+        // OPTIMIZATION: Get fresh activeId once and pass it through
+        const activeId = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getActiveId' });
+        await this.executeRebalance(this.currentCenterBin, true, activeId);
     }
 
-    private async executeRebalance(newCenterId: number, isMaintenance = false) {
+    private async executeRebalance(newCenterId: number, isMaintenance = false, cachedActiveId?: number) {
         if (this.isRebalancing) {
             logger.warn('Rebalance', 'Rebalance already in progress. Mutex lock active.');
             return;
@@ -332,8 +363,13 @@ export class DLMMBot {
             // 1. Remove Liquidity
             await this.removeLiquidity();
 
-            // 2. Add Liquidity
-            await this.addLiquidity(newCenterId);
+            // 2. Add Liquidity (OPTIMIZATION: Use cached activeId if available, otherwise fetch fresh)
+            const activeId = cachedActiveId ?? await this.publicClient.readContract({ 
+                address: POOL_ADDRESS, 
+                abi: PAIR_ABI, 
+                functionName: 'getActiveId' 
+            });
+            await this.addLiquidity(newCenterId, activeId);
 
             // Update tracking state
             this.lastActiveBin = newCenterId;
@@ -359,15 +395,24 @@ export class DLMMBot {
             idsToCheck.push(i);
         }
 
-        const balances = [];
-        for (const id of idsToCheck) {
-            const b = await this.publicClient.readContract({
-                address: POOL_ADDRESS,
-                abi: PAIR_ABI,
-                functionName: 'balanceOf',
-                args: [this.account.address, BigInt(id)]
-            });
-            if (b > 0n) balances.push({ id: BigInt(id), amount: b });
+        // OPTIMIZATION: Use parallel readContract calls to batch all balanceOf calls
+        const balanceCalls = idsToCheck.map(id => ({
+            address: POOL_ADDRESS as Address,
+            abi: PAIR_ABI,
+            functionName: 'balanceOf' as const,
+            args: [this.account.address, BigInt(id)] as const
+        }));
+
+        const balanceResults = await Promise.allSettled(
+            balanceCalls.map(call => this.publicClient.readContract(call as any))
+        );
+
+        const balances: { id: bigint; amount: bigint }[] = [];
+        for (let i = 0; i < balanceResults.length; i++) {
+            const result = balanceResults[i];
+            if (result.status === 'fulfilled' && (result.value as bigint) > 0n) {
+                balances.push({ id: BigInt(idsToCheck[i]), amount: result.value as bigint });
+            }
         }
 
         if (balances.length === 0) {
@@ -377,24 +422,31 @@ export class DLMMBot {
 
         logger.info('Rebalance', `Removing liquidity from ${balances.length} bins...`);
 
-        const idsToRemove = balances.map(b => b.id);
-        const amountsToRemove = balances.map(b => b.amount);
+        const idsToRemove: bigint[] = balances.map(b => b.id);
+        const amountsToRemove: bigint[] = balances.map(b => b.amount);
 
-        // Approval Check
-        const isApproved = await this.publicClient.readContract({
-            address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'isApprovedForAll', args: [this.account.address, ROUTER_ADDRESS]
-        });
+        // OPTIMIZATION: Cache approval status to avoid redundant checks
+        if (!this.isApproved) {
+            const isApprovedResult = await this.publicClient.readContract({
+                address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'isApprovedForAll', args: [this.account.address, ROUTER_ADDRESS]
+            });
+            this.isApproved = isApprovedResult;
+        }
 
-        if (!isApproved) {
+        if (!this.isApproved) {
             logger.info('Rebalance', `Approving pair...`);
-            // Skip simulation for approval (Monad RPC issue)
+            // OPTIMIZATION: Apply gas settings for better inclusion
             const hash = await this.walletClient.writeContract({
                 address: POOL_ADDRESS,
                 abi: PAIR_ABI,
                 functionName: 'setApprovalForAll',
-                args: [ROUTER_ADDRESS, true]
+                args: [ROUTER_ADDRESS, true],
+                gas: undefined, // Let viem estimate
+                maxFeePerGas: GAS_SETTINGS.MAX_FEE_PER_GAS,
+                maxPriorityFeePerGas: GAS_SETTINGS.MAX_PRIORITY_FEE_PER_GAS
             } as any);
             await this.publicClient.waitForTransactionReceipt({ hash });
+            this.isApproved = true;
             logger.info('Rebalance', `Approved.`);
         }
 
@@ -420,7 +472,13 @@ export class DLMMBot {
                 account: this.account
             });
 
-            const removeHash = await this.walletClient.writeContract(removeReq);
+            // OPTIMIZATION: Apply gas settings for better transaction inclusion
+            const { type, ...requestWithoutType } = removeReq as any;
+            const removeHash = await this.walletClient.writeContract({
+                ...requestWithoutType,
+                maxFeePerGas: GAS_SETTINGS.MAX_FEE_PER_GAS,
+                maxPriorityFeePerGas: GAS_SETTINGS.MAX_PRIORITY_FEE_PER_GAS
+            } as any);
             const receipt = await this.publicClient.waitForTransactionReceipt({ hash: removeHash });
 
             if (receipt.status === 'reverted') {
@@ -432,26 +490,33 @@ export class DLMMBot {
     }
 
 
-    private async addLiquidity(centerId: number) {
+    private async addLiquidity(centerId: number, cachedActiveId?: number) {
         // Step 1: Get fresh balances
-        // For native token, get native balance (MON), for non-native get ERC20 balance
+        // OPTIMIZATION: Parallel balance reads
         let balX: bigint;
         let balY: bigint;
 
         if (this.isTokenXNative) {
             // tokenX is native (WMON), get native balance
-            const nativeBalance = await this.publicClient.getBalance({ address: this.account.address });
+            // OPTIMIZATION: Parallel read of native and ERC20 balance
+            const [nativeBalance, tokenYBalance] = await Promise.all([
+                this.publicClient.getBalance({ address: this.account.address }),
+                this.publicClient.readContract({
+                    address: this.tokenY, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
+                })
+            ]);
             balX = nativeBalance;
-            // Get non-native token balance
-            balY = await this.publicClient.readContract({
-                address: this.tokenY, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
-            });
+            balY = tokenYBalance;
         } else {
             // tokenY is native (WMON), get native balance
-            const nativeBalance = await this.publicClient.getBalance({ address: this.account.address });
-            balX = await this.publicClient.readContract({
-                address: this.tokenX, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
-            });
+            // OPTIMIZATION: Parallel read of native and ERC20 balance
+            const [nativeBalance, tokenXBalance] = await Promise.all([
+                this.publicClient.getBalance({ address: this.account.address }),
+                this.publicClient.readContract({
+                    address: this.tokenX, abi: ERC20_ABI, functionName: 'balanceOf', args: [this.account.address]
+                })
+            ]);
+            balX = tokenXBalance;
             balY = nativeBalance;
         }
 
@@ -487,14 +552,14 @@ export class DLMMBot {
             await this.ensureApprove(this.tokenX, ROUTER_ADDRESS, balX);
         }
 
-        // Step 4: CRITICAL - Fetch FRESH activeId from chain
-        const freshActiveId = await this.publicClient.readContract({
+        // Step 4: CRITICAL - Use cached activeId if available, otherwise fetch fresh
+        const freshActiveId = cachedActiveId ?? await this.publicClient.readContract({
             address: POOL_ADDRESS,
             abi: PAIR_ABI,
             functionName: 'getActiveId'
         });
 
-        logger.info('Rebalance', `Fresh ActiveId from chain: ${freshActiveId} (requested: ${centerId})`);
+        logger.info('Rebalance', `ActiveId: ${freshActiveId} (requested: ${centerId})`);
 
         // Step 4.5: Reserve gas for native token before building params
         const GAS_RESERVE_WEI = BigInt(Math.floor(STRATEGY.MIN_GAS_RESERVE_MON * 1e18));
@@ -519,22 +584,45 @@ export class DLMMBot {
         // Calculate native token amount to send (msg.value)
         const nativeAmount = this.isTokenXNative ? balX : balY;
 
-        logger.info('Rebalance', `Simulating Add Liquidity (NATIVE)...`);
         logger.info('Rebalance', `Sending ${formatUnits(nativeAmount, 18)} native tokens as msg.value (reserved ${STRATEGY.MIN_GAS_RESERVE_MON} MON for gas)`);
 
         await retry(async () => {
-            const { request: addReq } = await this.publicClient.simulateContract({
-                address: ROUTER_ADDRESS,
-                abi: ROUTER_ABI,
-                functionName: 'addLiquidityNATIVE',
-                args: [params],
-                account: this.account,
-                value: nativeAmount
-            });
+            let addReq: any;
+            
+            // Try simulation first, but skip if RPC has txpool issues
+            try {
+                logger.info('Rebalance', `Simulating Add Liquidity (NATIVE)...`);
+                const simulated = await this.publicClient.simulateContract({
+                    address: ROUTER_ADDRESS,
+                    abi: ROUTER_ABI,
+                    functionName: 'addLiquidityNATIVE',
+                    args: [params],
+                    account: this.account,
+                    value: nativeAmount
+                });
+                addReq = simulated.request;
+            } catch (simError: any) {
+                // Skip simulation if txpool is not responding (Monad RPC issue)
+                const errorMsg = simError?.message || simError?.cause?.reason || simError?.shortMessage || '';
+                if (errorMsg.toLowerCase().includes('txpool not responding')) {
+                    logger.warn('Rebalance', 'Simulation failed (txpool not responding). Skipping simulation and sending directly...');
+                    addReq = {
+                        address: ROUTER_ADDRESS,
+                        abi: ROUTER_ABI,
+                        functionName: 'addLiquidityNATIVE',
+                        args: [params]
+                    } as any;
+                } else {
+                    throw simError;
+                }
+            }
 
+            // OPTIMIZATION: Apply gas settings for better transaction inclusion
             const addHash = await this.walletClient.writeContract({
                 ...addReq,
-                value: nativeAmount
+                value: nativeAmount,
+                maxFeePerGas: GAS_SETTINGS.MAX_FEE_PER_GAS,
+                maxPriorityFeePerGas: GAS_SETTINGS.MAX_PRIORITY_FEE_PER_GAS
             });
             logger.info('Rebalance', `Add Liquidity (NATIVE) Sent. Hash: ${addHash}`);
 
