@@ -24,7 +24,8 @@ export const STRATEGY = {
     REBALANCE_THRESH_PRICE: 0.0005, // 0.05%
     REBALANCE_THRESH_FEE_VALUE: 0.001, // 0.1%
     SLIPPAGE: 0.002, // 0.2%
-    MIN_GAS_RESERVE_MON: 1, // Minimum MON to keep for gas
+    MIN_GAS_RESERVE_MON: 10, // Minimum MON to reserve for gas in addLiquidityNATIVE operations
+    MIN_SAFE_BALANCE_MON: 1, // Minimum MON balance to keep bot running (safety stop threshold)
     GAS_RESERVE_PERCENT: 0.02,
     THREE_BIN_SPREAD: 1, // Range: [active-1, active, active+1]
 };

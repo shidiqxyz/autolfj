@@ -172,8 +172,8 @@ export class DLMMBot {
         const balWei = await this.publicClient.getBalance({ address: this.account.address });
         const balMon = parseFloat(formatUnits(balWei, 18));
 
-        if (balMon < STRATEGY.MIN_GAS_RESERVE_MON) {
-            logger.error('Health', `CRITICAL: Balance low (${balMon.toFixed(4)} MON). Pausing bot.`);
+        if (balMon < STRATEGY.MIN_SAFE_BALANCE_MON) {
+            logger.error('Health', `CRITICAL: Balance too low (${balMon.toFixed(4)} MON). Minimum safe balance: ${STRATEGY.MIN_SAFE_BALANCE_MON} MON. Stopping bot.`);
             process.exit(1);
         }
     }
@@ -468,11 +468,11 @@ export class DLMMBot {
         }
 
         // Step 2.5: Use only 90% of X balance for liquidity (reserve 10%), but use 100% of Y balance
-        const LIQUIDITY_PERCENTAGE = 99n; // 90%
+        const LIQUIDITY_PERCENTAGE = 95n; // 90%
         const PERCENTAGE_DIVISOR = 100n;
         if (balX > 0n) {
             balX = (balX * LIQUIDITY_PERCENTAGE) / PERCENTAGE_DIVISOR;
-            logger.info('Rebalance', `Using 99% of X balance: ${formatUnits(balX, this.tokenXDecimals)} (1% reserved)`);
+            logger.info('Rebalance', `Using 95% of X balance: ${formatUnits(balX, this.tokenXDecimals)} (5% reserved)`);
         }
         // Y balance uses 100% (no reserve)
         logger.info('Rebalance', `Using 100% of Y balance: ${formatUnits(balY, this.tokenYDecimals)} (no reserve)`);

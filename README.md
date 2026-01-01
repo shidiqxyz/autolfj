@@ -22,7 +22,8 @@ src/
 - **Liquidity Reserve**: Uses 90% of balance for liquidity, reserves 10% in wallet
 
 ## Safety Features
-- Gas Reserve: Keeps 5 MON minimum
+- Gas Reserve: Reserves 10 MON for gas fees in every `addLiquidityNATIVE` operation
+- Safety Stop: Bot stops automatically if balance falls below 1 MON
 - Slippage Protection: 5 bins tolerance
 - Receipt Validation: Detects on-chain reverts
 - Retry Logic: 3 attempts with exponential backoff
@@ -32,7 +33,7 @@ src/
 
 ## Prerequisites
 - Node.js >= 18
-- MON for gas (minimum 5 MON reserve)
+- MON for gas (minimum 10 MON reserve for `addLiquidityNATIVE` operations)
 - Pool tokens (WMON/AUSD or relevant pair)
 
 ## Setup
@@ -54,8 +55,9 @@ RPC_URL=https://rpc.monad.xyz
 ```
 
 ### 3. Fund Wallet
-- At least 5 MON for gas
+- At least 10 MON for gas (reserved for `addLiquidityNATIVE` operations)
 - Pool tokens to provide liquidity
+- **Note**: Bot will stop if balance falls below 1 MON for safety
 
 ### 4. Run
 ```bash
@@ -102,7 +104,8 @@ Edit `src/config/index.ts` to change:
 - Pool/Router addresses
 - Strategy thresholds
 - Network settings
-- Gas reserve minimum
+- Gas reserve minimum (default: 10 MON for `addLiquidityNATIVE`)
+- Minimum safe balance (default: 1 MON - bot stops if below this)
 
 Edit `src/core/Bot.ts` to change:
 - Maintenance rebalance interval (default: 1 minute)
