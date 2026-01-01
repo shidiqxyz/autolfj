@@ -20,6 +20,7 @@ import {
 } from '../config';
 import { ERC20_ABI, PAIR_ABI, ROUTER_ABI } from '../abis';
 import { retry, sleep, logger } from '../utils';
+import { calculateILFromBins, binIdToPrice } from '../utils/ilCalculator';
 
 export class DLMMBot {
     private publicClient: PublicClient;
@@ -31,12 +32,14 @@ export class DLMMBot {
     private lastActiveBin = 0;
     private currentCenterBin = 0; // Center bin of current 3-bin range [center-1, center, center+1]
     private isApproved = false; // Cache approval status to avoid redundant checks
+    private entryBinId: number | null = null; // Track entry bin for IL calculation
+    private entryTimestamp: number | null = null; // Track when position was entered
 
     // Time-based range tracking
     private inRangeStartTime: number | null = null; // Timestamp when position entered IN-RANGE state
     private outOfRangeStartTime: number | null = null; // Timestamp when position entered OUT-OF-RANGE state
     private inRangeTimer: NodeJS.Timeout | null = null; // Timer for 3-minute maintenance rebalance
-    private readonly MAINTENANCE_REBALANCE_INTERVAL_MS = 1 * 60 * 1000; // 1 minutes
+    private readonly MAINTENANCE_REBALANCE_INTERVAL_MS = 1.5 * 60 * 1000; // 1 minutes
 
     // Pool Info
     private tokenX!: Address;
@@ -137,11 +140,23 @@ export class DLMMBot {
             if (foundCenterBin > 0) {
                 this.currentCenterBin = foundCenterBin;
                 this.lastActiveBin = activeId;
+                // Set entry tracking for IL calculation (use current center bin as entry point)
+                if (this.entryBinId === null) {
+                    this.entryBinId = foundCenterBin;
+                    this.entryTimestamp = Date.now();
+                    logger.info('IL', `Entry tracked for existing position: Bin ${foundCenterBin}`);
+                }
                 logger.info('Entry', `Existing position detected. Center bin: ${foundCenterBin}, Active bin: ${activeId}`);
             } else {
                 // Fallback: set to active bin
                 this.currentCenterBin = activeId;
                 this.lastActiveBin = activeId;
+                // Set entry tracking for IL calculation
+                if (this.entryBinId === null) {
+                    this.entryBinId = activeId;
+                    this.entryTimestamp = Date.now();
+                    logger.info('IL', `Entry tracked for existing position: Bin ${activeId}`);
+                }
                 logger.info('Entry', `Setting center bin to active bin: ${activeId}`);
             }
         }
@@ -273,6 +288,11 @@ export class DLMMBot {
             // OPTIMIZATION: Cache activeId to avoid re-reading in addLiquidity
             const activeId = await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getActiveId' });
             const isInRange = this.isPositionInRange(activeId);
+            
+            // Calculate and log IL if entry is tracked
+            if (this.entryBinId !== null && this.currentCenterBin > 0) {
+                this.logImpermanentLoss(activeId);
+            }
 
             // OUT-OF-RANGE handling (priority)
             if (!isInRange) {
@@ -374,6 +394,13 @@ export class DLMMBot {
             // Update tracking state
             this.lastActiveBin = newCenterId;
             this.currentCenterBin = newCenterId;
+            
+            // Track entry for IL calculation (reset on standard rebalance, keep on maintenance)
+            if (!isMaintenance) {
+                this.entryBinId = newCenterId;
+                this.entryTimestamp = Date.now();
+                logger.info('IL', `Entry tracked: Bin ${newCenterId} at ${new Date(this.entryTimestamp).toISOString()}`);
+            }
 
             // Reset time tracking after rebalance
             this.inRangeStartTime = null;
@@ -781,5 +808,40 @@ export class DLMMBot {
             await this.publicClient.waitForTransactionReceipt({ hash });
             logger.info('Approve', `Approved ${token} (unlimited)`);
         }, 3, 2000);
+    }
+
+    /**
+     * Calculate and log impermanent loss metrics
+     */
+    private logImpermanentLoss(currentActiveId: number) {
+        if (this.entryBinId === null) return;
+        
+        try {
+            const ilResult = calculateILFromBins(this.entryBinId, currentActiveId, this.binStep, 3);
+            const entryPrice = binIdToPrice(this.entryBinId, this.binStep);
+            const currentPrice = binIdToPrice(currentActiveId, this.binStep);
+            
+            // Format prices for display
+            const priceChangePercent = (ilResult.priceRatio - 1) * 100;
+            
+            // Log IL info (only log if significant movement or periodically)
+            const ilSign = ilResult.impermanentLossPercent >= 0 ? '+' : '';
+            logger.info('IL', 
+                `IL: ${ilSign}${ilResult.impermanentLossPercent.toFixed(4)}% | ` +
+                `Price: ${currentPrice.toFixed(6)} (${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(3)}%) | ` +
+                `Entry: ${this.entryBinId} → Current: ${currentActiveId}`
+            );
+            
+            // Warn if IL becomes significant (e.g., > -1%)
+            if (ilResult.impermanentLossPercent < -1.0) {
+                logger.warn('IL', 
+                    `⚠️ Significant IL detected: ${ilResult.impermanentLossPercent.toFixed(4)}%. ` +
+                    `Consider if fees are offsetting this loss.`
+                );
+            }
+        } catch (err) {
+            // Silently fail IL calculation to avoid disrupting main flow
+            logger.error('IL', 'Error calculating IL:', err);
+        }
     }
 }
