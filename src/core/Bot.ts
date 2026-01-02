@@ -31,6 +31,7 @@ export class DLMMBot {
 
     // State
     private isProcessing = false;
+    private activePositions: number[] = [];
 
     // Pool Info
     private tokenX!: Address;
@@ -126,38 +127,50 @@ export class DLMMBot {
             }) as number;
 
             // Check bins around activeId for existing liquidity
-            const rangeToCheck = 20;
+            // WIDENED RANGE TO 100 to catch stragglers
+            const rangeToCheck = 100;
             const binsToCheck: number[] = [];
             for (let i = activeId - rangeToCheck; i <= activeId + rangeToCheck; i++) {
                 binsToCheck.push(i);
             }
 
-            const balanceCalls = binsToCheck.map(id => ({
-                address: POOL_ADDRESS as Address,
-                abi: PAIR_ABI,
-                functionName: 'balanceOf' as const,
-                args: [this.account.address, BigInt(id)] as const
-            }));
-
-            const balanceResults = await Promise.allSettled(
-                balanceCalls.map(call => this.publicClient.readContract(call as any))
-            );
-
+            // Split into chunks to avoid RPC limits
+            const chunkSize = 50;
             const existingPositions: number[] = [];
-            for (let i = 0; i < balanceResults.length; i++) {
-                const result = balanceResults[i];
-                if (result.status === 'fulfilled' && (result.value as bigint) > 0n) {
-                    existingPositions.push(binsToCheck[i]);
+
+            for (let i = 0; i < binsToCheck.length; i += chunkSize) {
+                const chunk = binsToCheck.slice(i, i + chunkSize);
+                const balanceCalls = chunk.map(id => ({
+                    address: POOL_ADDRESS as Address,
+                    abi: PAIR_ABI,
+                    functionName: 'balanceOf' as const,
+                    args: [this.account.address, BigInt(id)] as const
+                }));
+
+                const balanceResults = await Promise.allSettled(
+                    balanceCalls.map(call => this.publicClient.readContract(call as any))
+                );
+
+                for (let j = 0; j < balanceResults.length; j++) {
+                    const result = balanceResults[j];
+                    if (result.status === 'fulfilled' && (result.value as bigint) > 0n) {
+                        existingPositions.push(chunk[j]);
+                    }
                 }
             }
 
             if (existingPositions.length > 0) {
                 logger.warn('Cleanup', `⚠️ Found ${existingPositions.length} existing positions: [${existingPositions.join(', ')}]`);
                 logger.info('Cleanup', '🧹 Removing existing positions...');
+
+                // Set active positions so removeLiquidity works correctly
+                this.activePositions = [...existingPositions];
+
                 await this.removeLiquidity(existingPositions);
                 logger.info('Cleanup', '✅ Cleanup complete');
             } else {
                 logger.info('Cleanup', '✅ No existing positions found. Starting fresh.');
+                this.activePositions = [];
             }
         } catch (err: any) {
             logger.warn('Cleanup', `⚠️ Cleanup failed (non-critical): ${err?.message || err}`);
@@ -175,6 +188,15 @@ export class DLMMBot {
             logger.info('Cycle', `${'='.repeat(60)}`);
 
             try {
+                // Safety: Check if we have active stuck positions from previous failed cycle
+                if (this.activePositions.length > 0) {
+                    logger.warn('Cycle', `⚠️ Found ${this.activePositions.length} stuck positions from previous cycle! Removing first...`);
+                    await this.removeLiquidity(this.activePositions);
+                    // Add a small delay and continue to next iteration to verify clean state
+                    await sleep(2000);
+                    continue;
+                }
+
                 // Step 1: Check MON balance
                 const balance = await this.publicClient.getBalance({ address: this.account.address });
                 const balanceMON = parseFloat(formatUnits(balance, 18));
@@ -355,6 +377,10 @@ export class DLMMBot {
 
             // Extract position IDs from receipt
             positionIds = this.extractPositionIds(receipt, bins);
+
+            // TRACK POSITIONS
+            this.activePositions = [...positionIds];
+
         }, 3, 500);
 
         return positionIds;
@@ -509,6 +535,8 @@ export class DLMMBot {
 
         if (idsToRemove.length === 0) {
             logger.warn('Remove', '⚠️ No liquidity found to remove.');
+            // CLEAR STATE even if none found, to avoid infinite loop of trying to remove nothing
+            this.activePositions = [];
             return;
         }
 
@@ -551,6 +579,10 @@ export class DLMMBot {
                 }
 
                 logger.info('Remove', `✅ Liquidity removed successfully`);
+
+                // CLEAR STATE ON SUCCESS
+                this.activePositions = [];
+
             } catch (err: any) {
                 // Try without simulation if it fails
                 const errorMsg = err?.message || '';
@@ -580,6 +612,9 @@ export class DLMMBot {
                 }
 
                 logger.info('Remove', `✅ Liquidity removed successfully`);
+
+                // CLEAR STATE ON SUCCESS
+                this.activePositions = [];
             }
         }, 3, 2000);
     }
