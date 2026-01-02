@@ -23,7 +23,7 @@ export const GAS_SETTINGS = {
 
 // SPAM BOT STRATEGY CONSTANTS
 export const STRATEGY = {
-    MIN_GAS_RESERVE_MON: 10, // Reserve for gas operations
+    MIN_GAS_RESERVE_MON: 50, // Reserve for gas operations
     MIN_SAFE_BALANCE_MON: 1, // Stop bot if balance < this threshold
     LIQUIDITY_USE_PERCENT: 1, // Use 100% of usable MON
     DELAY_AFTER_ADD_MIN: 10, // Min seconds to wait after adding liquidity
