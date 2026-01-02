@@ -103,7 +103,12 @@ export class DLMMBot {
         this.tokenXSymbol = tokenXSymbol;
         this.tokenYSymbol = tokenYSymbol;
 
-        this.isTokenXNative = this.tokenXSymbol.toUpperCase() === 'WMON' || this.tokenXSymbol.toUpperCase() === 'WNATIVE';
+
+        // On Monad, the native token is MON, wrapped as WMON or WNATIVE
+        // WETH is a separate ERC20 token, NOT the native token!
+        const nativeSymbols = ['WMON', 'WNATIVE'];
+        this.isTokenXNative = nativeSymbols.includes(this.tokenXSymbol.toUpperCase());
+
 
         logger.info('Init', `✅ TokenX: ${this.tokenXSymbol}, TokenY: ${this.tokenYSymbol}`);
         logger.info('Init', `✅ Native token: ${this.isTokenXNative ? this.tokenXSymbol : this.tokenYSymbol}`);
@@ -204,9 +209,9 @@ export class DLMMBot {
                 // Step 6: Select 2 bins
                 // If Native is X: [activeId, activeId + 1] (Upper side)
                 // If Native is Y: [activeId - 1, activeId] (Lower side)
-                const bins = this.isTokenXNative
-                    ? [activeId, activeId + 1]
-                    : [activeId - 1, activeId];
+                // Step 6: Define strategy bins (Fixed 3-bin strategy)
+                // We use deltaIds [-1, 0, 1] always
+                const bins = [activeId - 1, activeId, activeId + 1];
 
                 logger.info('Pool', `🎯 Target bins: [${bins.join(', ')}] (${this.isTokenXNative ? 'Upper/Base' : 'Lower/Quote'})`);
 
@@ -358,30 +363,41 @@ export class DLMMBot {
     private buildTwoBinParams(activeId: number, bins: number[], monAmount: bigint, nonNativeAmount: bigint) {
         const PRECISION = BigInt('1000000000000000000'); // 1e18
 
-        // Build deltaIds relative to activeId
-        const deltaIds: bigint[] = bins.map(bin => BigInt(bin - activeId));
-
-        // Distribution Strategy:
-        // Native (MON): Split 50/50 across both bins
-        // Non-Native (Token): 100% to activeId (if we have any)
-
-        const distNative: bigint[] = [PRECISION / 2n, PRECISION / 2n];
-
-        let distNonNative: bigint[] = [0n, 0n];
-        if (nonNativeAmount > 0n) {
-            if (bins[0] === activeId) {
-                distNonNative = [PRECISION, 0n];
-            } else if (bins[1] === activeId) {
-                distNonNative = [0n, PRECISION];
-            }
-        }
-
-        const distributionX = this.isTokenXNative ? distNative : distNonNative;
-        const distributionY = this.isTokenXNative ? distNonNative : distNative;
-
         const amountX = this.isTokenXNative ? monAmount : nonNativeAmount;
         const amountY = this.isTokenXNative ? nonNativeAmount : monAmount;
 
+        // Determine strategy based on available tokens
+        let deltaIds: bigint[];
+        let distributionX: bigint[];
+        let distributionY: bigint[];
+        let strategy: string;
+
+        if (amountX > 0n && amountY === 0n) {
+            // Only X available: single-sided to bin +1
+            strategy = 'Single-sided (X only)';
+            deltaIds = [1n];
+            distributionX = [PRECISION];
+            distributionY = [PRECISION]; // Required by contract but unused
+        } else if (amountX === 0n && amountY > 0n) {
+            // Only Y available: single-sided to bin -1
+            strategy = 'Single-sided (Y only)';
+            deltaIds = [-1n];
+            distributionX = [PRECISION]; // Required by contract but unused
+            distributionY = [PRECISION];
+        } else if (amountX > 0n && amountY > 0n) {
+            // Both tokens available: use 2-bin strategy (skipping center)
+            // X (Base) -> Bin +1
+            // Y (Quote) -> Bin -1
+            strategy = 'Two-sided (2-bin)';
+            deltaIds = [-1n, 1n];
+            distributionX = [0n, PRECISION]; // All X to bin +1 (index 1)
+            distributionY = [PRECISION, 0n]; // All Y to bin -1 (index 0)
+        } else {
+            // No tokens available (should not reach here due to earlier check)
+            throw new Error('No tokens available for liquidity');
+        }
+
+        logger.info('Params', `📋 Strategy: ${strategy}`);
         logger.info('Params', `📋 DeltaIds: [${deltaIds.join(', ')}]`);
         logger.info('Params', `📋 AmountX: ${formatUnits(amountX, this.tokenXDecimals)} ${this.tokenXSymbol}`);
         logger.info('Params', `📋 AmountY: ${formatUnits(amountY, this.tokenYDecimals)} ${this.tokenYSymbol}`);
@@ -440,6 +456,9 @@ export class DLMMBot {
 
     private async removeLiquidity(binIds: number[]) {
         logger.info('Remove', `➖ Removing liquidity from bins [${binIds.join(', ')}]...`);
+        logger.info('Remove', `📊 Pool TokenX: ${this.tokenX} (${this.tokenXSymbol})`);
+        logger.info('Remove', `📊 Pool TokenY: ${this.tokenY} (${this.tokenYSymbol})`);
+        logger.info('Remove', `📊 Is TokenX Native: ${this.isTokenXNative}`);
 
         // 1. Ensure Router is approved to spend LBPair tokens
         const isApproved = await this.publicClient.readContract({
@@ -497,6 +516,7 @@ export class DLMMBot {
 
         await retry(async () => {
             const nonNativeToken = this.isTokenXNative ? this.tokenY : this.tokenX;
+            logger.info('Remove', `🎯 Passing nonNativeToken to router: ${nonNativeToken}`);
 
             try {
                 const { request: removeReq } = await this.publicClient.simulateContract({
