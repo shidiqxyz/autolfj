@@ -10,8 +10,9 @@ export const PRIVATE_KEY = process.env.PRIVATE_KEY as Hex;
 export const CHAIN_ID = 143; // Monad Mainnet
 
 // CONTRACT ADDRESSES
-//WETH
-export const POOL_ADDRESS = '0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5' as Address;
+//Pool WETH (0x0594c7505A667933c7d8CB1064BcA58A2211a3be)
+//Pool AUSD (0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5)
+export const POOL_ADDRESS = '0x0594c7505A667933c7d8CB1064BcA58A2211a3be' as Address;
 export const ROUTER_ADDRESS = '0x18556DA13313f3532c54711497A8FedAC273220E' as Address;
 
 // Gas price settings (higher = faster inclusion = less retries)
@@ -24,7 +25,7 @@ export const GAS_SETTINGS = {
 export const STRATEGY = {
     MIN_GAS_RESERVE_MON: 10, // Reserve for gas operations
     MIN_SAFE_BALANCE_MON: 1, // Stop bot if balance < this threshold
-    LIQUIDITY_USE_PERCENT: 0.95, // Use 95% of usable MON
+    LIQUIDITY_USE_PERCENT: 1, // Use 100% of usable MON
     DELAY_AFTER_ADD_MIN: 10, // Min seconds to wait after adding liquidity
     DELAY_AFTER_ADD_MAX: 90, // Max seconds to wait after adding liquidity
     DELAY_AFTER_REMOVE_MIN: 5, // Min seconds to wait after removing liquidity

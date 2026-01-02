@@ -183,14 +183,12 @@ export class DLMMBot {
                 }
 
                 // Step 3: Calculate usable MON
-                const usableMON = balance - BigInt(Math.floor(STRATEGY.MIN_GAS_RESERVE_MON * 1e18));
-                if (usableMON <= 0n) {
-                    logger.warn('Balance', '⚠️ No usable MON after gas reserve. Skipping cycle...');
-                    await sleep(randomDelay(STRATEGY.DELAY_AFTER_REMOVE_MIN, STRATEGY.DELAY_AFTER_REMOVE_MAX));
-                    continue;
-                }
+                const reserveAmount = STRATEGY.MIN_GAS_RESERVE_MON;
+                let usableMON = balance - BigInt(Math.floor(reserveAmount * 1e18));
 
-                // Step 4: Calculate amount for add (95% of usable MON)
+                if (usableMON < 0n) usableMON = 0n;
+
+                // Step 4: Calculate amount for add
                 const amountForAdd = (usableMON * BigInt(Math.floor(STRATEGY.LIQUIDITY_USE_PERCENT * 100))) / 100n;
                 logger.info('Liquidity', `📊 Usable MON: ${formatUnits(usableMON, 18)} → Adding: ${formatUnits(amountForAdd, 18)} MON (${STRATEGY.LIQUIDITY_USE_PERCENT * 100}%)`);
 
@@ -203,9 +201,14 @@ export class DLMMBot {
 
                 logger.info('Pool', `📈 Active Bin ID: ${activeId}`);
 
-                // Step 6: Select 2 bins (activeId, activeId+1)
-                const bins = [activeId, activeId + 1];
-                logger.info('Pool', `🎯 Target bins: [${bins.join(', ')}]`);
+                // Step 6: Select 2 bins
+                // If Native is X: [activeId, activeId + 1] (Upper side)
+                // If Native is Y: [activeId - 1, activeId] (Lower side)
+                const bins = this.isTokenXNative
+                    ? [activeId, activeId + 1]
+                    : [activeId - 1, activeId];
+
+                logger.info('Pool', `🎯 Target bins: [${bins.join(', ')}] (${this.isTokenXNative ? 'Upper/Base' : 'Lower/Quote'})`);
 
                 // Step 7: Removed (was AUSD estimation)
                 // Step 8: Add liquidity
@@ -261,25 +264,32 @@ export class DLMMBot {
     private async addLiquidity(bins: number[], monAmount: bigint): Promise<number[]> {
         logger.info('Add', `➕ Adding liquidity to bins [${bins.join(', ')}]...`);
 
-        // Check actual AUSD balance
+        // Check non-native token balance
         const nonNativeToken = this.isTokenXNative ? this.tokenY : this.tokenX;
-        const ausdBalance = await this.publicClient.readContract({
+        const nonNativeSymbol = this.isTokenXNative ? this.tokenYSymbol : this.tokenXSymbol;
+        const nonNativeDecimals = this.isTokenXNative ? this.tokenYDecimals : this.tokenXDecimals;
+
+        const nonNativeBalance = await this.publicClient.readContract({
             address: nonNativeToken,
             abi: ERC20_ABI,
             functionName: 'balanceOf',
             args: [this.account.address]
         }) as bigint;
 
-        logger.info('Add', `💰 AUSD balance: ${formatUnits(ausdBalance, this.tokenYDecimals)} ${this.tokenYSymbol}`);
+        logger.info('Add', `💰 ${nonNativeSymbol} balance: ${formatUnits(nonNativeBalance, nonNativeDecimals)} ${nonNativeSymbol}`);
 
-        // Always use full AUSD balance and let Router refund the unused amount
-        // This bypasses potential price estimation errors
-        let actualAusdAmount = ausdBalance;
-        logger.info('Add', `💰 Using full AUSD balance: ${formatUnits(actualAusdAmount, this.tokenYDecimals)} (Router will refund excess)`);
+        if (monAmount === 0n && nonNativeBalance === 0n) {
+            logger.warn('Add', `⚠️ No MON or ${nonNativeSymbol} to add. Skipping...`);
+            return [];
+        }
 
-        // Ensure AUSD approval if we have AUSD to add
-        if (actualAusdAmount > 0n) {
-            await this.ensureApprove(nonNativeToken, ROUTER_ADDRESS, actualAusdAmount);
+        // Always use full non-native balance and let Router refund the unused amount
+        let actualNonNativeAmount = nonNativeBalance;
+        logger.info('Add', `💰 Using full ${nonNativeSymbol} balance: ${formatUnits(actualNonNativeAmount, nonNativeDecimals)} (Router will refund excess)`);
+
+        // Ensure approval if we have tokens to add
+        if (actualNonNativeAmount > 0n) {
+            await this.ensureApprove(nonNativeToken, ROUTER_ADDRESS, actualNonNativeAmount);
         }
 
         // Get activeId for params
@@ -290,7 +300,7 @@ export class DLMMBot {
         }) as number;
 
         // Build params for 2-bin add
-        const params = this.buildTwoBinParams(activeId, bins, monAmount, actualAusdAmount);
+        const params = this.buildTwoBinParams(activeId, bins, monAmount, actualNonNativeAmount);
 
         let positionIds: number[] = [];
 
@@ -340,32 +350,37 @@ export class DLMMBot {
 
             // Extract position IDs from receipt
             positionIds = this.extractPositionIds(receipt, bins);
-        }, 3, 2000);
+        }, 3, 500);
 
         return positionIds;
     }
 
-    private buildTwoBinParams(activeId: number, bins: number[], monAmount: bigint, ausdAmount: bigint) {
+    private buildTwoBinParams(activeId: number, bins: number[], monAmount: bigint, nonNativeAmount: bigint) {
         const PRECISION = BigInt('1000000000000000000'); // 1e18
 
         // Build deltaIds relative to activeId
         const deltaIds: bigint[] = bins.map(bin => BigInt(bin - activeId));
 
-        // Distribution: 50/50 split for MON across both bins
-        const distributionX: bigint[] = [PRECISION / 2n, PRECISION / 2n];
+        // Distribution Strategy:
+        // Native (MON): Split 50/50 across both bins
+        // Non-Native (Token): 100% to activeId (if we have any)
 
-        // AUSD goes only to activeId (first bin if bins[0] === activeId)
-        let distributionY: bigint[];
-        if (bins[0] === activeId && ausdAmount > 0n) {
-            distributionY = [PRECISION, 0n]; // All AUSD to activeId
-        } else if (bins[1] === activeId && ausdAmount > 0n) {
-            distributionY = [0n, PRECISION]; // All AUSD to activeId
-        } else {
-            distributionY = [0n, 0n]; // No AUSD (single-sided MON)
+        const distNative: bigint[] = [PRECISION / 2n, PRECISION / 2n];
+
+        let distNonNative: bigint[] = [0n, 0n];
+        if (nonNativeAmount > 0n) {
+            if (bins[0] === activeId) {
+                distNonNative = [PRECISION, 0n];
+            } else if (bins[1] === activeId) {
+                distNonNative = [0n, PRECISION];
+            }
         }
 
-        const amountX = this.isTokenXNative ? monAmount : ausdAmount;
-        const amountY = this.isTokenXNative ? ausdAmount : monAmount;
+        const distributionX = this.isTokenXNative ? distNative : distNonNative;
+        const distributionY = this.isTokenXNative ? distNonNative : distNative;
+
+        const amountX = this.isTokenXNative ? monAmount : nonNativeAmount;
+        const amountY = this.isTokenXNative ? nonNativeAmount : monAmount;
 
         logger.info('Params', `📋 DeltaIds: [${deltaIds.join(', ')}]`);
         logger.info('Params', `📋 AmountX: ${formatUnits(amountX, this.tokenXDecimals)} ${this.tokenXSymbol}`);
