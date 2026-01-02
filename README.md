@@ -9,20 +9,22 @@ src/
 ├── config/         # Configuration & Constants
 ├── core/           # Main Bot Logic
 ├── utils/          # Helper functions
-12: └── index.ts        # Entry point
+└── index.ts        # Entry point
 ```
 
 ## Features
-- **Target Pool**: `0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5` (MON/AUSD)
+- **Target Pool**: 
+  - **MON/WETH**: `0x0594c7505A667933c7d8CB1064BcA58A2211a3be` (Default)
+  - **MON/AUSD**: `0xdd0a93642B0e1e938a75B400f31095Af4C4BECE5`
+  - *Note: Switch pools by updating `POOL_ADDRESS` in `src/config/index.ts`*
 - **Strategy**: Cyclic Add/Remove in a 2-bin range `[activeId, activeId + 1]`
 - **Cycle-based**: 
   1. Adds liquidity
   2. Waits (random delay)
   3. Removes liquidity
-  4. Waits (random delay)
-  5. Repeats
+  4. Repeats
 - **Native Token Support**: Uses `addLiquidityNATIVE` and `removeLiquidityNATIVE`
-- **Liquidity Usage**: Uses 95% of usable balance per cycle
+- **Liquidity Usage**: Uses 100% of usable balance per cycle
 
 ## Safety Features
 - **Gas Reserve**: Reserves 10 MON for gas fees
@@ -33,7 +35,7 @@ src/
 ## Prerequisites
 - Node.js >= 18
 - MON for gas and liquidity
-- AUSD (optional, bot handles single-sided MON if needed, but intended for mixed usage if available)
+- WETH (optional, bot handles single-sided MON if needed, but intended for mixed usage if available)
 
 ## Setup
 
@@ -77,7 +79,7 @@ pm2 start npm --name "dlmm-bot" --cron-restart="0 0 * * *" -- start
 ## Configuration
 Edit `src/config/index.ts` to change:
 - `STRATEGY` settings:
-    - `LIQUIDITY_USE_PERCENT`: Percentage of balance to use (Default: 0.95 for 95%)
+    - `LIQUIDITY_USE_PERCENT`: Percentage of balance to use (Default: 1 for 100%)
     - `DELAY_AFTER_ADD_MIN/MAX`: Time to hold position (Default: 10-90s)
     - `DELAY_AFTER_REMOVE_MIN/MAX`: Time to wait before next cycle (Default: 5-30s)
     - `MIN_GAS_RESERVE_MON`: Amount to keep for gas (Default: 10 MON)
@@ -97,10 +99,10 @@ Edit `src/config/index.ts` to change:
 - **2-Bin Range**: `[activeId, activeId + 1]`
 - **Distribution**:
     - **Token X (MON)**: Split 50/50 between `activeId` and `activeId + 1`
-    - **Token Y (AUSD)**: 
+    - **Token Y (WETH)**: 
         - If `activeId` is the first bin: 100% to `activeId`
         - If `activeId` is the second bin: 100% to `activeId`
-        - Typically aims effectively for `activeId` for AUSD.
+        - Typically aims effectively for `activeId` for WETH.
 
 ## Disclaimer
 ⚠️ Use at your own risk. This bot handles private keys and executes real transactions.
