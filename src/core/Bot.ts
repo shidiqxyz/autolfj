@@ -32,6 +32,7 @@ export class DLMMBot {
     // State
     private isProcessing = false;
     private activePositions: number[] = [];
+    private lastEntryActiveId: number | null = null;
 
     // Pool Info
     private tokenX!: Address;
@@ -250,12 +251,48 @@ export class DLMMBot {
                 // Step 9: Log position IDs
                 logger.info('Position', `✅ Position IDs: [${positionIds.join(', ')}]`);
 
-                // Step 10: Random delay 10-90s
+                // Step 10: Random delay 10-90s (Initial wait)
                 const delayAfterAdd = randomDelay(STRATEGY.DELAY_AFTER_ADD_MIN, STRATEGY.DELAY_AFTER_ADD_MAX);
-                logger.info('Delay', `⏳ Waiting ${(delayAfterAdd / 1000).toFixed(1)}s before remove...`);
+                logger.info('Delay', `⏳ Waiting ${(delayAfterAdd / 1000).toFixed(1)}s (base delay)...`);
                 await sleep(delayAfterAdd);
 
-                // Step 11: Remove 100% using maxInt128 (now replaced with logic)
+                // IL PROTECTION: Check drift before removing
+                if (this.lastEntryActiveId !== null) {
+                    const maxHoldTime = STRATEGY.MAX_HOLD_DURATION_SEC * 1000;
+                    const checkInterval = 5000;
+                    const startCheckTime = Date.now();
+
+                    while (true) {
+                        try {
+                            const currentActiveId = await this.publicClient.readContract({
+                                address: POOL_ADDRESS,
+                                abi: PAIR_ABI,
+                                functionName: 'getActiveId'
+                            }) as number;
+
+                            const drift = Math.abs(currentActiveId - this.lastEntryActiveId);
+
+                            if (drift <= STRATEGY.MAX_BIN_DRIFT) {
+                                logger.info('IL-Guard', `✅ Price stable (Drift: ${drift} <= ${STRATEGY.MAX_BIN_DRIFT}). Safe to remove.`);
+                                break;
+                            }
+
+                            const elapsed = Date.now() - startCheckTime;
+                            if (elapsed > maxHoldTime) {
+                                logger.warn('IL-Guard', `⏰ Max hold exceeded (${(elapsed / 1000).toFixed(1)}s). Force closing despite drift (${drift}).`);
+                                break;
+                            }
+
+                            logger.warn('IL-Guard', `⚠️ High drift detected (${drift} bins). Holding to avoid IL... (${(elapsed / 1000).toFixed(1)}s / ${STRATEGY.MAX_HOLD_DURATION_SEC}s)`);
+                            await sleep(checkInterval);
+                        } catch (err) {
+                            logger.error('IL-Guard', 'Error checking price, forcing continue', err);
+                            break;
+                        }
+                    }
+                }
+
+                // Step 11: Remove Liquidity
                 await this.removeLiquidity(positionIds);
 
                 // Step 12: Log completion
@@ -326,6 +363,9 @@ export class DLMMBot {
             functionName: 'getActiveId'
         }) as number;
 
+        // Track entry price for IL protection
+        this.lastEntryActiveId = activeId;
+
         // Build params for 2-bin add
         const params = this.buildTwoBinParams(activeId, bins, monAmount, actualNonNativeAmount);
 
@@ -392,6 +432,12 @@ export class DLMMBot {
         const amountX = this.isTokenXNative ? monAmount : nonNativeAmount;
         const amountY = this.isTokenXNative ? nonNativeAmount : monAmount;
 
+        // Calculate min amounts with slippage
+        // 0.1% = 10 BPS. Formula: amount * (10000 - bps) / 10000
+        const slippageBps = BigInt(Math.floor(STRATEGY.SLIPPAGE_TOLERANCE * 100));
+        const amountXMin = (amountX * (10000n - slippageBps)) / 10000n;
+        const amountYMin = (amountY * (10000n - slippageBps)) / 10000n;
+
         // Determine strategy based on available tokens
         let deltaIds: bigint[];
         let distributionX: bigint[];
@@ -425,8 +471,8 @@ export class DLMMBot {
 
         logger.info('Params', `📋 Strategy: ${strategy}`);
         logger.info('Params', `📋 DeltaIds: [${deltaIds.join(', ')}]`);
-        logger.info('Params', `📋 AmountX: ${formatUnits(amountX, this.tokenXDecimals)} ${this.tokenXSymbol}`);
-        logger.info('Params', `📋 AmountY: ${formatUnits(amountY, this.tokenYDecimals)} ${this.tokenYSymbol}`);
+        logger.info('Params', `📋 AmountX: ${formatUnits(amountX, this.tokenXDecimals)} ${this.tokenXSymbol} (Min: ${formatUnits(amountXMin, this.tokenXDecimals)})`);
+        logger.info('Params', `📋 AmountY: ${formatUnits(amountY, this.tokenYDecimals)} ${this.tokenYSymbol} (Min: ${formatUnits(amountYMin, this.tokenYDecimals)})`);
 
         return {
             tokenX: this.tokenX,
@@ -434,10 +480,10 @@ export class DLMMBot {
             binStep: BigInt(this.binStep),
             amountX,
             amountY,
-            amountXMin: 0n,
-            amountYMin: 0n,
+            amountXMin,
+            amountYMin,
             activeIdDesired: BigInt(activeId),
-            idSlippage: 5n,
+            idSlippage: 3n,
             deltaIds,
             distributionX,
             distributionY,
@@ -629,7 +675,7 @@ export class DLMMBot {
             args: [this.account.address, spender]
         });
 
-        if (allowance > 0n) {
+        if (allowance >= amount) {
             logger.info('Approve', `✅ ${token} already approved`);
             return;
         }

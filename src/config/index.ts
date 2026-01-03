@@ -28,8 +28,12 @@ export const STRATEGY = {
     LIQUIDITY_USE_PERCENT: 1, // Use 100% of usable MON
     DELAY_AFTER_ADD_MIN: 10, // Min seconds to wait after adding liquidity
     DELAY_AFTER_ADD_MAX: 90, // Max seconds to wait after adding liquidity
-    DELAY_AFTER_REMOVE_MIN: 5, // Min seconds to wait after removing liquidity
-    DELAY_AFTER_REMOVE_MAX: 30, // Max seconds to wait after removing liquidity
+    DELAY_AFTER_REMOVE_MIN: 0, // Min seconds to wait after removing liquidity
+    DELAY_AFTER_REMOVE_MAX: 1, // Max seconds to wait after removing liquidity
+    // IL Protection
+    MAX_BIN_DRIFT: 2, // Max allowed bin deviation before holding (approx 0.2% if step=100)
+    MAX_HOLD_DURATION_SEC: 600, // Max seconds to hold a losing position (5 mins)
+    SLIPPAGE_TOLERANCE: 0.1, // 0.1% slippage tolerance
 };
 
 if (!PRIVATE_KEY) {
