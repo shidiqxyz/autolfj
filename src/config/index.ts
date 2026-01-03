@@ -21,19 +21,29 @@ export const GAS_SETTINGS = {
     MAX_PRIORITY_FEE_PER_GAS: 2n * 1_000_000_000n, // 2 Gwei tip
 };
 
-// SPAM BOT STRATEGY CONSTANTS
 export const STRATEGY = {
-    MIN_GAS_RESERVE_MON: 50, // Reserve for gas operations
-    MIN_SAFE_BALANCE_MON: 1, // Stop bot if balance < this threshold
-    LIQUIDITY_USE_PERCENT: 1, // Use 100% of usable MON
-    DELAY_AFTER_ADD_MIN: 10, // Min seconds to wait after adding liquidity
-    DELAY_AFTER_ADD_MAX: 90, // Max seconds to wait after adding liquidity
-    DELAY_AFTER_REMOVE_MIN: 0, // Min seconds to wait after removing liquidity
-    DELAY_AFTER_REMOVE_MAX: 1, // Max seconds to wait after removing liquidity
-    // IL Protection
-    MAX_BIN_DRIFT: 2, // Max allowed bin deviation before holding (approx 0.2% if step=100)
-    MAX_HOLD_DURATION_SEC: 600, // Max seconds to hold a losing position (5 mins)
-    SLIPPAGE_TOLERANCE: 0.1, // 0.1% slippage tolerance
+    // Market Maker Strategy (3-Bin Active Range)
+    BIN_RANGE: 3,
+    BIN_OFFSET: 1, // +/- 1 bin from active
+    LIQUIDITY_USAGE_PERCENT: 97, // Use 97% of available balances
+    MIN_GAS_RESERVE_MON: 50, // Amount to subtract from balance for gas buffer
+    MIN_SAFE_BALANCE_MON: 1.0, // Critical low balance stop threshold
+
+    // Timing & Cooldowns
+    MIN_REBALANCE_INTERVAL: 60, // 60s cooldown
+    OUT_OF_RANGE_GRACE: 180, // 3m grace period
+    POLL_INTERVAL: 5000, // 5s loop
+
+    // Execution
+    MAX_SLIPPAGE_PERCENT: 0.15, // 0.15%
+
+    // Safety Modules
+    MAX_GAS_PER_TX_MON: 0.15,
+    MAX_REBALANCES_PER_DAY: 200,
+    MIN_EXPECTED_REWARD_MON: 0.20,
+    SAFE_SHUTDOWN_RPC_FAILURES: 10,
+    PARTIAL_REBALANCE_OVERLAP: 2, // If overlap >= 2 bins, skip rebalance
+    VOLATILITY_MULTIPLIER: 2, // Double cooldown if volatile
 };
 
 if (!PRIVATE_KEY) {

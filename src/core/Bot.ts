@@ -1,3 +1,6 @@
+
+// src/core/Bot.ts
+
 import {
     PublicClient,
     WalletClient,
@@ -7,7 +10,8 @@ import {
     createWalletClient,
     http,
     decodeEventLog,
-    parseAbiItem
+    parseAbiItem,
+    parseUnits
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
@@ -22,17 +26,10 @@ import {
 import { ERC20_ABI, PAIR_ABI, ROUTER_ABI } from '../abis';
 import { retry, sleep, logger, randomDelay } from '../utils';
 
-
-
 export class DLMMBot {
     private publicClient: PublicClient;
     private walletClient: WalletClient;
     private account = privateKeyToAccount(PRIVATE_KEY.startsWith('0x') ? PRIVATE_KEY as `0x${string}` : `0x${PRIVATE_KEY}` as `0x${string}`);
-
-    // State
-    private isProcessing = false;
-    private activePositions: number[] = [];
-    private lastEntryActiveId: number | null = null;
 
     // Pool Info
     private tokenX!: Address;
@@ -43,6 +40,18 @@ export class DLMMBot {
     private tokenXSymbol!: string;
     private tokenYSymbol!: string;
     private isTokenXNative!: boolean;
+
+    // State Variables (Memory)
+    private lastActiveBinId: number | null = null;
+    private lastRebalanceTimestamp: number = 0;
+    private currentBins: number[] | null = null;
+    private executionLock: boolean = false;
+
+    // Safety State
+    private lastObservedBins: number[] = []; // Rolling window size 3
+    private consecutiveFailures: number = 0;
+    private dailyRebalanceCount: number = 0;
+    private lastResetDay: number = new Date().getDay();
 
     constructor() {
         this.publicClient = createPublicClient({
@@ -68,16 +77,16 @@ export class DLMMBot {
     }
 
     public async start() {
-        logger.info('Init', `🚀 Starting Spam Bot on Monad Mainnet...`);
+        logger.info('Init', `🚀 Starting LFJ MM Bot on Monad...`);
         logger.info('Init', `📍 Pool: ${POOL_ADDRESS}`);
         logger.info('Init', `👛 Account: ${this.account.address}`);
 
         try {
             await this.initializePoolData();
-            await this.cleanupExistingPositions();
-            await this.runSpamCycle();
+            // Optional: check initial balance
+            await this.runMarketMakingLogic();
         } catch (err) {
-            logger.error('Init', 'Critical error:', err);
+            logger.error('Init', 'Critical error during startup:', err);
             process.exit(1);
         }
     }
@@ -105,595 +114,471 @@ export class DLMMBot {
         this.tokenXSymbol = tokenXSymbol;
         this.tokenYSymbol = tokenYSymbol;
 
-
-        // On Monad, the native token is MON, wrapped as WMON or WNATIVE
-        // WETH is a separate ERC20 token, NOT the native token!
         const nativeSymbols = ['WMON', 'WNATIVE'];
         this.isTokenXNative = nativeSymbols.includes(this.tokenXSymbol.toUpperCase());
 
-
-        logger.info('Init', `✅ TokenX: ${this.tokenXSymbol}, TokenY: ${this.tokenYSymbol}`);
-        logger.info('Init', `✅ Native token: ${this.isTokenXNative ? this.tokenXSymbol : this.tokenYSymbol}`);
-        logger.info('Init', `✅ Bin Step: ${this.binStep}`);
+        logger.info('Init', `✅ Active: ${this.tokenXSymbol}/${this.tokenYSymbol} (Native: ${this.isTokenXNative ? 'X' : 'Y'})`);
     }
 
-    private async cleanupExistingPositions() {
-        logger.info('Cleanup', '🔍 Checking for existing positions...');
-
-        try {
-            const activeId = await this.publicClient.readContract({
-                address: POOL_ADDRESS,
-                abi: PAIR_ABI,
-                functionName: 'getActiveId'
-            }) as number;
-
-            // Check bins around activeId for existing liquidity
-            // WIDENED RANGE TO 100 to catch stragglers
-            const rangeToCheck = 100;
-            const binsToCheck: number[] = [];
-            for (let i = activeId - rangeToCheck; i <= activeId + rangeToCheck; i++) {
-                binsToCheck.push(i);
-            }
-
-            // Split into chunks to avoid RPC limits
-            const chunkSize = 50;
-            const existingPositions: number[] = [];
-
-            for (let i = 0; i < binsToCheck.length; i += chunkSize) {
-                const chunk = binsToCheck.slice(i, i + chunkSize);
-                const balanceCalls = chunk.map(id => ({
-                    address: POOL_ADDRESS as Address,
-                    abi: PAIR_ABI,
-                    functionName: 'balanceOf' as const,
-                    args: [this.account.address, BigInt(id)] as const
-                }));
-
-                const balanceResults = await Promise.allSettled(
-                    balanceCalls.map(call => this.publicClient.readContract(call as any))
-                );
-
-                for (let j = 0; j < balanceResults.length; j++) {
-                    const result = balanceResults[j];
-                    if (result.status === 'fulfilled' && (result.value as bigint) > 0n) {
-                        existingPositions.push(chunk[j]);
-                    }
-                }
-            }
-
-            if (existingPositions.length > 0) {
-                logger.warn('Cleanup', `⚠️ Found ${existingPositions.length} existing positions: [${existingPositions.join(', ')}]`);
-                logger.info('Cleanup', '🧹 Removing existing positions...');
-
-                // Set active positions so removeLiquidity works correctly
-                this.activePositions = [...existingPositions];
-
-                await this.removeLiquidity(existingPositions);
-                logger.info('Cleanup', '✅ Cleanup complete');
-            } else {
-                logger.info('Cleanup', '✅ No existing positions found. Starting fresh.');
-                this.activePositions = [];
-            }
-        } catch (err: any) {
-            logger.warn('Cleanup', `⚠️ Cleanup failed (non-critical): ${err?.message || err}`);
-            logger.info('Cleanup', 'Continuing with spam cycle...');
-        }
-    }
-
-    private async runSpamCycle() {
-        let cycleCount = 0;
+    // ==================================================
+    // MAIN LOOP (SINGLE-THREADED)
+    // ==================================================
+    private async runMarketMakingLogic() {
+        logger.info('Strategy', `🤖 MM Strategy Active: 3-Bin Range [${STRATEGY.BIN_RANGE}]`);
 
         while (true) {
-            cycleCount++;
-            logger.info('Cycle', `\n${'='.repeat(60)}`);
-            logger.info('Cycle', `🔄 Starting Cycle #${cycleCount}`);
-            logger.info('Cycle', `${'='.repeat(60)}`);
-
             try {
-                // Safety: Check if we have active stuck positions from previous failed cycle
-                if (this.activePositions.length > 0) {
-                    logger.warn('Cycle', `⚠️ Found ${this.activePositions.length} stuck positions from previous cycle! Removing first...`);
-                    await this.removeLiquidity(this.activePositions);
-                    // Add a small delay and continue to next iteration to verify clean state
-                    await sleep(2000);
+
+                // Safety Module F: Daily Churn Limit
+                if (this.checkDailyLimit()) {
+                    await sleep(60000); // Sleep 1 min if limited
                     continue;
                 }
 
-                // Step 1: Check MON balance
-                const balance = await this.publicClient.getBalance({ address: this.account.address });
-                const balanceMON = parseFloat(formatUnits(balance, 18));
-
-                logger.info('Balance', `💰 Current MON balance: ${balanceMON.toFixed(4)} MON`);
-
-                // Step 2: Exit if insufficient balance
-                if (balanceMON < STRATEGY.MIN_SAFE_BALANCE_MON) {
-                    logger.error('Balance', `❌ Insufficient MON (${balanceMON.toFixed(4)} < ${STRATEGY.MIN_SAFE_BALANCE_MON}). Stopping bot.`);
-                    process.exit(0);
+                if (this.executionLock) {
+                    await sleep(1000);
+                    continue;
                 }
 
-                // Step 3: Calculate usable MON
-                const reserveAmount = STRATEGY.MIN_GAS_RESERVE_MON;
-                let usableMON = balance - BigInt(Math.floor(reserveAmount * 1e18));
-
-                if (usableMON < 0n) usableMON = 0n;
-
-                // Step 4: Calculate amount for add
-                const amountForAdd = (usableMON * BigInt(Math.floor(STRATEGY.LIQUIDITY_USE_PERCENT * 100))) / 100n;
-                logger.info('Liquidity', `📊 Usable MON: ${formatUnits(usableMON, 18)} → Adding: ${formatUnits(amountForAdd, 18)} MON (${STRATEGY.LIQUIDITY_USE_PERCENT * 100}%)`);
-
-                // Step 5: Get activeId
+                // Get Active Bin
                 const activeId = await this.publicClient.readContract({
                     address: POOL_ADDRESS,
                     abi: PAIR_ABI,
                     functionName: 'getActiveId'
                 }) as number;
 
-                logger.info('Pool', `📈 Active Bin ID: ${activeId}`);
-
-                // Step 6: Select 2 bins
-                // If Native is X: [activeId, activeId + 1] (Upper side)
-                // If Native is Y: [activeId - 1, activeId] (Lower side)
-                // Step 6: Define strategy bins (Fixed 3-bin strategy)
-                // We use deltaIds [-1, 0, 1] always
-                const bins = [activeId - 1, activeId, activeId + 1];
-
-                logger.info('Pool', `🎯 Target bins: [${bins.join(', ')}] (${this.isTokenXNative ? 'Upper/Base' : 'Lower/Quote'})`);
-
-                // Step 7: Removed (was AUSD estimation)
-                // Step 8: Add liquidity
-                const positionIds = await this.addLiquidity(bins, amountForAdd);
-
-                if (!positionIds || positionIds.length === 0) {
-                    logger.warn('Cycle', '⚠️ No positions created. Skipping remove...');
-                    await sleep(randomDelay(STRATEGY.DELAY_AFTER_REMOVE_MIN, STRATEGY.DELAY_AFTER_REMOVE_MAX));
+                // Safety Module A: Anti-Churn Bin Stability Check
+                if (this.detectBinChurn(activeId)) {
+                    logger.warn('Safety', `Stable check: Churn detected. Skipping rebalance.`);
+                    await sleep(STRATEGY.POLL_INTERVAL);
                     continue;
                 }
 
-                // Step 9: Log position IDs
-                logger.info('Position', `✅ Position IDs: [${positionIds.join(', ')}]`);
-
-                // Step 10: Random delay 10-90s (Initial wait)
-                const delayAfterAdd = randomDelay(STRATEGY.DELAY_AFTER_ADD_MIN, STRATEGY.DELAY_AFTER_ADD_MAX);
-                logger.info('Delay', `⏳ Waiting ${(delayAfterAdd / 1000).toFixed(1)}s (base delay)...`);
-                await sleep(delayAfterAdd);
-
-                // IL PROTECTION: Check drift before removing
-                if (this.lastEntryActiveId !== null) {
-                    const maxHoldTime = STRATEGY.MAX_HOLD_DURATION_SEC * 1000;
-                    const checkInterval = 5000;
-                    const startCheckTime = Date.now();
-
-                    while (true) {
-                        try {
-                            const currentActiveId = await this.publicClient.readContract({
-                                address: POOL_ADDRESS,
-                                abi: PAIR_ABI,
-                                functionName: 'getActiveId'
-                            }) as number;
-
-                            const drift = Math.abs(currentActiveId - this.lastEntryActiveId);
-
-                            if (drift <= STRATEGY.MAX_BIN_DRIFT) {
-                                logger.info('IL-Guard', `✅ Price stable (Drift: ${drift} <= ${STRATEGY.MAX_BIN_DRIFT}). Safe to remove.`);
-                                break;
-                            }
-
-                            const elapsed = Date.now() - startCheckTime;
-                            if (elapsed > maxHoldTime) {
-                                logger.warn('IL-Guard', `⏰ Max hold exceeded (${(elapsed / 1000).toFixed(1)}s). Force closing despite drift (${drift}).`);
-                                break;
-                            }
-
-                            logger.warn('IL-Guard', `⚠️ High drift detected (${drift} bins). Holding to avoid IL... (${(elapsed / 1000).toFixed(1)}s / ${STRATEGY.MAX_HOLD_DURATION_SEC}s)`);
-                            await sleep(checkInterval);
-                        } catch (err) {
-                            logger.error('IL-Guard', 'Error checking price, forcing continue', err);
-                            break;
-                        }
-                    }
+                // Check 1: Initial State
+                if (this.currentBins === null) {
+                    logger.info('Loop', 'Startup: No active positions. Initial rebalance...');
+                    await this.rebalance("initial", activeId);
+                    await sleep(STRATEGY.POLL_INTERVAL);
+                    continue;
                 }
 
-                // Step 11: Remove Liquidity
-                await this.removeLiquidity(positionIds);
+                // Check 2: In Range?
+                const isInRange = this.currentBins.includes(activeId);
+                // Safety Module C: Partial Rebalance Guard
+                const targetBins = [activeId - STRATEGY.BIN_OFFSET, activeId, activeId + STRATEGY.BIN_OFFSET];
+                const overlap = this.currentBins.filter(b => targetBins.includes(b)).length;
 
-                // Step 12: Log completion
-                const newBalance = await this.publicClient.getBalance({ address: this.account.address });
-                const newBalanceMON = parseFloat(formatUnits(newBalance, 18));
-                const gasUsed = balanceMON - newBalanceMON;
+                if (isInRange) {
+                    // Still earning fees, do nothing
+                    await sleep(STRATEGY.POLL_INTERVAL);
+                    continue;
+                }
 
-                logger.info('Cycle', `\n${'─'.repeat(60)}`);
-                logger.info('Cycle', `✅ Cycle #${cycleCount} Complete`);
-                logger.info('Cycle', `💰 Balance: ${balanceMON.toFixed(4)} → ${newBalanceMON.toFixed(4)} MON`);
-                logger.info('Cycle', `⛽ Gas used: ~${gasUsed.toFixed(6)} MON`);
-                logger.info('Cycle', `${'─'.repeat(60)}\n`);
+                if (overlap >= STRATEGY.PARTIAL_REBALANCE_OVERLAP) {
+                    logger.info('Safety', `Partial overlap ok (${overlap} bins). Holding...`);
+                    await sleep(STRATEGY.POLL_INTERVAL);
+                    continue;
+                }
 
+                const now = Math.floor(Date.now() / 1000); // Seconds
 
+                // Check 3: Grace Period
+                if ((now - this.lastRebalanceTimestamp) < STRATEGY.OUT_OF_RANGE_GRACE) {
+                    // Grace period active
+                    await sleep(STRATEGY.POLL_INTERVAL);
+                    continue;
+                }
+
+                // Safety Module B: Dynamic Cooldown
+                const volatility = this.lastActiveBinId !== null && Math.abs(activeId - this.lastActiveBinId) >= 2;
+                const activeCooldown = volatility ? STRATEGY.MIN_REBALANCE_INTERVAL * STRATEGY.VOLATILITY_MULTIPLIER : STRATEGY.MIN_REBALANCE_INTERVAL;
+
+                if ((now - this.lastRebalanceTimestamp) < activeCooldown) {
+                    // Cooldown active
+                    await sleep(STRATEGY.POLL_INTERVAL);
+                    continue;
+                }
+
+                // ACTION: Rebalance
+                await this.rebalance("out_of_range", activeId);
+
+                // Success - Reset failure checks
+                this.consecutiveFailures = 0;
 
             } catch (err: any) {
-                logger.error('Cycle', `❌ Cycle #${cycleCount} failed:`);
+                // Safety Module E: Soft Fail Recovery
+                this.consecutiveFailures++;
+                logger.error('Loop', `❌ Error in loop (Failures: ${this.consecutiveFailures}): ${err?.message || err}`);
 
-                // Enhanced error logging
-                if (err.message) logger.error('Error', `Message: ${err.message}`);
-                if (err.cause?.reason) logger.error('Error', `Reason: ${err.cause.reason}`);
-                if (err.shortMessage) logger.error('Error', `Short: ${err.shortMessage}`);
-                if (err.details) logger.error('Error', `Details: ${err.details}`);
-
-                logger.warn('Cycle', '⏭️ Skipping to next cycle in 30s...');
-                await sleep(30000);
-            }
-        }
-    }
-
-
-
-    private async addLiquidity(bins: number[], monAmount: bigint): Promise<number[]> {
-        logger.info('Add', `➕ Adding liquidity to bins [${bins.join(', ')}]...`);
-
-        // Check non-native token balance
-        const nonNativeToken = this.isTokenXNative ? this.tokenY : this.tokenX;
-        const nonNativeSymbol = this.isTokenXNative ? this.tokenYSymbol : this.tokenXSymbol;
-        const nonNativeDecimals = this.isTokenXNative ? this.tokenYDecimals : this.tokenXDecimals;
-
-        const nonNativeBalance = await this.publicClient.readContract({
-            address: nonNativeToken,
-            abi: ERC20_ABI,
-            functionName: 'balanceOf',
-            args: [this.account.address]
-        }) as bigint;
-
-        logger.info('Add', `💰 ${nonNativeSymbol} balance: ${formatUnits(nonNativeBalance, nonNativeDecimals)} ${nonNativeSymbol}`);
-
-        if (monAmount === 0n && nonNativeBalance === 0n) {
-            logger.warn('Add', `⚠️ No MON or ${nonNativeSymbol} to add. Skipping...`);
-            return [];
-        }
-
-        // Always use full non-native balance and let Router refund the unused amount
-        let actualNonNativeAmount = nonNativeBalance;
-        logger.info('Add', `💰 Using full ${nonNativeSymbol} balance: ${formatUnits(actualNonNativeAmount, nonNativeDecimals)} (Router will refund excess)`);
-
-        // Ensure approval if we have tokens to add
-        if (actualNonNativeAmount > 0n) {
-            await this.ensureApprove(nonNativeToken, ROUTER_ADDRESS, actualNonNativeAmount);
-        }
-
-        // Get activeId for params
-        const activeId = await this.publicClient.readContract({
-            address: POOL_ADDRESS,
-            abi: PAIR_ABI,
-            functionName: 'getActiveId'
-        }) as number;
-
-        // Track entry price for IL protection
-        this.lastEntryActiveId = activeId;
-
-        // Build params for 2-bin add
-        const params = this.buildTwoBinParams(activeId, bins, monAmount, actualNonNativeAmount);
-
-        let positionIds: number[] = [];
-
-        await retry(async () => {
-            let addReq: any;
-
-            try {
-                logger.info('Add', '🔍 Simulating add liquidity...');
-                const simulated = await this.publicClient.simulateContract({
-                    address: ROUTER_ADDRESS,
-                    abi: ROUTER_ABI,
-                    functionName: 'addLiquidityNATIVE',
-                    args: [params],
-                    account: this.account,
-                    value: monAmount
-                });
-                addReq = simulated.request;
-            } catch (simError: any) {
-                const errorMsg = simError?.message || '';
-                if (errorMsg.toLowerCase().includes('txpool not responding')) {
-                    logger.warn('Add', '⚠️ Simulation failed (txpool). Sending directly...');
-                    addReq = {
-                        address: ROUTER_ADDRESS,
-                        abi: ROUTER_ABI,
-                        functionName: 'addLiquidityNATIVE',
-                        args: [params]
-                    };
-                } else {
-                    throw simError;
+                // Safety Module H: Safe Shutdown
+                if (this.consecutiveFailures >= STRATEGY.SAFE_SHUTDOWN_RPC_FAILURES) {
+                    logger.error('Safety', `🛑 SAFE SHUTDOWN: Too many failures.`);
+                    await this.safeShutdown();
+                    process.exit(1);
                 }
+
+                const backoff = Math.min(30 * this.consecutiveFailures, 600); // Max 10 mins
+                await sleep(backoff * 1000);
             }
 
-            const addHash = await this.walletClient.writeContract({
-                ...addReq,
-                value: monAmount,
-                maxFeePerGas: GAS_SETTINGS.MAX_FEE_PER_GAS,
-                maxPriorityFeePerGas: GAS_SETTINGS.MAX_PRIORITY_FEE_PER_GAS
-            });
-            logger.info('Add', `📤 TX sent: ${addHash}`);
-
-            const receipt = await this.publicClient.waitForTransactionReceipt({ hash: addHash });
-            if (receipt.status === 'reverted') {
-                throw new Error(`Add liquidity reverted: ${addHash}`);
-            }
-
-            logger.info('Add', `✅ Liquidity added successfully`);
-
-            // Extract position IDs from receipt
-            positionIds = this.extractPositionIds(receipt, bins);
-
-            // TRACK POSITIONS
-            this.activePositions = [...positionIds];
-
-        }, 3, 500);
-
-        return positionIds;
+            // Allow state to settle
+            await sleep(STRATEGY.POLL_INTERVAL);
+            this.lastActiveBinId = (await this.publicClient.readContract({ address: POOL_ADDRESS, abi: PAIR_ABI, functionName: 'getActiveId' }) as number);
+        }
     }
 
-    private buildTwoBinParams(activeId: number, bins: number[], monAmount: bigint, nonNativeAmount: bigint) {
-        const PRECISION = BigInt('1000000000000000000'); // 1e18
+    // ==================================================
+    // REBALANCE CORE
+    // ==================================================
+    private async rebalance(reason: string, activeId: number) {
+        this.executionLock = true;
+        logger.info('Rebalance', `Starting rebalance [${reason}] @ Bin ${activeId}`);
 
-        const amountX = this.isTokenXNative ? monAmount : nonNativeAmount;
-        const amountY = this.isTokenXNative ? nonNativeAmount : monAmount;
+        try {
+            // Safety Module D: Gas Spike Protection
+            const gasPrice = await this.publicClient.getGasPrice();
+            const maxGasFee = parseUnits(STRATEGY.MAX_GAS_PER_TX_MON.toString(), 18);
+            // Rough estimate for big complex tx: 500k gas
+            const estimatedCost = gasPrice * 500000n;
+            if (estimatedCost > maxGasFee) {
+                logger.info('Safety', `⛽ Gas spike (${formatUnits(estimatedCost, 18)} MON). Skipping.`);
+                return;
+            }
 
-        // Calculate min amounts with slippage
-        // 0.1% = 10 BPS. Formula: amount * (10000 - bps) / 10000
-        const slippageBps = BigInt(Math.floor(STRATEGY.SLIPPAGE_TOLERANCE * 100));
-        const amountXMin = (amountX * (10000n - slippageBps)) / 10000n;
-        const amountYMin = (amountY * (10000n - slippageBps)) / 10000n;
+            // Safety Module G: Profitability Check
+            // Simplified: If gas cost is excessively high compared to expected buffer or logic
+            // For now, relying on Gas Spike Protection as the primary "cost" guard.
+            // (Real profitability requires historical fee query which is complex here)
 
-        // Determine strategy based on available tokens
-        let deltaIds: bigint[];
-        let distributionX: bigint[];
-        let distributionY: bigint[];
-        let strategy: string;
+            // Step 1: Remove ALL existing liquidity
+            if (this.currentBins !== null && this.currentBins.length > 0) {
+                await this.removeLiquidity(this.currentBins);
+                // Wait for indexing? Usually tx confirmation is enough.
+            }
 
-        if (amountX > 0n && amountY === 0n) {
-            // Only X available: single-sided to bin +1
-            strategy = 'Single-sided (X only)';
-            deltaIds = [1n];
-            distributionX = [PRECISION];
-            distributionY = [PRECISION]; // Required by contract but unused
-        } else if (amountX === 0n && amountY > 0n) {
-            // Only Y available: single-sided to bin -1
-            strategy = 'Single-sided (Y only)';
-            deltaIds = [-1n];
-            distributionX = [PRECISION]; // Required by contract but unused
-            distributionY = [PRECISION];
-        } else if (amountX > 0n && amountY > 0n) {
-            // Both tokens available: use 2-bin strategy (skipping center)
-            // X (Base) -> Bin +1
-            // Y (Quote) -> Bin -1
-            strategy = 'Two-sided (2-bin)';
-            deltaIds = [-1n, 1n];
-            distributionX = [0n, PRECISION]; // All X to bin +1 (index 1)
-            distributionY = [PRECISION, 0n]; // All Y to bin -1 (index 0)
-        } else {
-            // No tokens available (should not reach here due to earlier check)
-            throw new Error('No tokens available for liquidity');
+            // Step 2: Read Balances
+            const balanceNative = await this.publicClient.getBalance({ address: this.account.address });
+            const tokenAddress = this.isTokenXNative ? this.tokenY : this.tokenX;
+            const balanceToken = await this.publicClient.readContract({
+                address: tokenAddress,
+                abi: ERC20_ABI,
+                functionName: 'balanceOf',
+                args: [this.account.address]
+            }) as bigint;
+
+            // Gas Reserve Check
+            // Safety Module I: Low Balance Stop
+            const minSafeBalance = parseUnits(STRATEGY.MIN_SAFE_BALANCE_MON.toString(), 18);
+            if (balanceNative < minSafeBalance) {
+                logger.warn('Rebalance', `⚠️ Low Balance (${formatUnits(balanceNative, 18)} < ${STRATEGY.MIN_SAFE_BALANCE_MON}). Stopping.`);
+                return;
+            }
+
+            // Calculate Usable (Reserve for Gas)
+            const gasReserve = parseUnits(STRATEGY.MIN_GAS_RESERVE_MON.toString(), 18);
+            let usableNative = ((balanceNative - gasReserve) * BigInt(Math.floor(STRATEGY.LIQUIDITY_USAGE_PERCENT * 100))) / 10000n;
+
+            // Clamp to 0
+            if (usableNative < 0n) usableNative = 0n;
+
+            const usableToken = (balanceToken * BigInt(Math.floor(STRATEGY.LIQUIDITY_USAGE_PERCENT * 100))) / 10000n;
+
+            // Step 3: Define Target
+            // RE-READ Active ID to prevent slippage reverts (market moves during removeLiquidity)
+            const currentActiveId = await this.publicClient.readContract({
+                address: POOL_ADDRESS,
+                abi: PAIR_ABI,
+                functionName: 'getActiveId'
+            }) as number;
+
+            // [active-1, active, active+1]
+            const targetBins = [
+                currentActiveId - STRATEGY.BIN_OFFSET,
+                currentActiveId,
+                currentActiveId + STRATEGY.BIN_OFFSET
+            ];
+
+            // Step 4: Add Liquidity
+            await this.addLiquidity(targetBins, usableNative, usableToken, currentActiveId);
+
+            // Step 5: Update State
+            this.currentBins = targetBins;
+            this.lastActiveBinId = currentActiveId;
+            this.lastRebalanceTimestamp = Math.floor(Date.now() / 1000);
+            this.dailyRebalanceCount++;
+
+            logger.info('Rebalance', `✅ SUCCESS: Active in bins [${targetBins.join(', ')}]`);
+
+        } catch (e: any) {
+            logger.error('Rebalance', `❌ Failed: ${e?.message}`);
+            // If failed, we might be in weird state (removed but not added).
+            // Soft fail loop will retry.
+            throw e;
+        } finally {
+            this.executionLock = false;
+        }
+    }
+
+    // ==================================================
+    // LIQUIDITY ACTIONS
+    // ==================================================
+
+    private async addLiquidity(bins: number[], usableNative: bigint, usableToken: bigint, activeId: number) {
+        if (usableNative <= 0n && usableToken <= 0n) {
+            logger.warn('Add', 'No funds to add!');
+            return;
         }
 
-        logger.info('Params', `📋 Strategy: ${strategy}`);
-        logger.info('Params', `📋 DeltaIds: [${deltaIds.join(', ')}]`);
-        logger.info('Params', `📋 AmountX: ${formatUnits(amountX, this.tokenXDecimals)} ${this.tokenXSymbol} (Min: ${formatUnits(amountXMin, this.tokenXDecimals)})`);
-        logger.info('Params', `📋 AmountY: ${formatUnits(amountY, this.tokenYDecimals)} ${this.tokenYSymbol} (Min: ${formatUnits(amountYMin, this.tokenYDecimals)})`);
+        // Helper to figure out X vs Y
+        // If TokenX is Native (MON):
+        // usableNative = AmountX, usableToken = AmountY
 
-        return {
+        let amountX = this.isTokenXNative ? usableNative : usableToken;
+        let amountY = this.isTokenXNative ? usableToken : usableNative;
+
+        // DYNAMIC UNIFORM DISTRIBUTION STRATEGY
+        // We must avoid minting liquidity in bins where we provide (0, 0) amounts.
+        // This causes "Broken Distribution" or similar reverts.
+
+        const candidates = [
+            { delta: -1, takesX: false, takesY: true }, // Lower: pure Y
+            { delta: 0, takesX: true, takesY: true }, // Active: Both
+            { delta: 1, takesX: true, takesY: false } // Upper: pure X
+        ];
+
+        const PRECISION = BigInt(1e18);
+        const validBins: { delta: number, distX: bigint, distY: bigint }[] = [];
+
+        // 1. Identify valid bins (must have >0 amount for at least one compatible token)
+        const activeBins = candidates.filter(c =>
+            (c.takesX && amountX > 0n) || (c.takesY && amountY > 0n)
+        );
+
+        if (activeBins.length === 0) {
+            logger.warn('Add', 'No valid bins to add liquidity to (balances too low?).');
+            return;
+        }
+
+        // 2. Calculate Distributions
+        // Count how many bins will share X and Y
+        const countX = activeBins.filter(b => b.takesX).length;
+        const countY = activeBins.filter(b => b.takesY).length;
+
+        // Share per bin
+        const shareX = countX > 0 ? PRECISION / BigInt(countX) : 0n;
+        const shareY = countY > 0 ? PRECISION / BigInt(countY) : 0n;
+
+        // 3. Construct Arrays
+        // Note: Sum of distributions MUST be 1e18 (if amount > 0)
+
+        let allocatedX = 0n;
+        let allocatedY = 0n;
+
+        activeBins.forEach((bin, i) => {
+            let dx = 0n;
+            let dy = 0n;
+
+            if (bin.takesX && amountX > 0n) dx = shareX;
+            if (bin.takesY && amountY > 0n) dy = shareY;
+
+            // Handle rounding for last valid bin of that type
+            // Check if any subsequent bin takes X
+            const pendingX = activeBins.slice(i + 1).some(b => b.takesX);
+            // If NO pending bins take X, and this one does, give it the remainder
+            if (!pendingX && bin.takesX && amountX > 0n) dx = PRECISION - allocatedX;
+
+            const pendingY = activeBins.slice(i + 1).some(b => b.takesY);
+            if (!pendingY && bin.takesY && amountY > 0n) dy = PRECISION - allocatedY;
+
+            if (amountX > 0n && bin.takesX) allocatedX += dx;
+            if (amountY > 0n && bin.takesY) allocatedY += dy;
+
+            validBins.push({ delta: bin.delta, distX: dx, distY: dy });
+        });
+
+        // Map to contract format
+        // deltaIds relative to activeId
+        const activeIdBig = BigInt(activeId);
+        const deltaIds = validBins.map(b => BigInt(b.delta));
+        const distributionX = validBins.map(b => b.distX);
+        const distributionY = validBins.map(b => b.distY);
+
+        // Approvals
+        const nonNativeToken = this.isTokenXNative ? this.tokenY : this.tokenX;
+        const nonNativeAmount = this.isTokenXNative ? amountY : amountX;
+        await this.ensureApprove(nonNativeToken, ROUTER_ADDRESS, nonNativeAmount);
+
+        // Native Amount (for value field)
+        const nativeAmount = this.isTokenXNative ? amountX : amountY;
+
+        // Params
+        const slippageBps = BigInt(Math.floor(STRATEGY.MAX_SLIPPAGE_PERCENT * 100));
+        const minAmountX = amountX - (amountX * slippageBps) / 10000n;
+        const minAmountY = amountY - (amountY * slippageBps) / 10000n;
+
+        const params = {
             tokenX: this.tokenX,
             tokenY: this.tokenY,
             binStep: BigInt(this.binStep),
-            amountX,
-            amountY,
-            amountXMin,
-            amountYMin,
-            activeIdDesired: BigInt(activeId),
-            idSlippage: 3n,
-            deltaIds,
-            distributionX,
-            distributionY,
+            amountX: amountX,
+            amountY: amountY,
+            amountXMin: minAmountX,
+            amountYMin: minAmountY,
+            activeIdDesired: activeIdBig,
+            idSlippage: 10n,
+            deltaIds: deltaIds,
+            distributionX: distributionX,
+            distributionY: distributionY,
             to: this.account.address,
             refundTo: this.account.address,
             deadline: BigInt(Math.floor(Date.now() / 1000) + 300)
         };
+
+        const { request } = await this.publicClient.simulateContract({
+            address: ROUTER_ADDRESS,
+            abi: ROUTER_ABI,
+            functionName: 'addLiquidityNATIVE',
+            args: [params],
+            account: this.account,
+            value: nativeAmount
+        });
+
+        const hash = await this.walletClient.writeContract(request);
+        logger.info('Add', `Tx sent: ${hash}`);
+        await this.publicClient.waitForTransactionReceipt({ hash });
     }
 
-    private extractPositionIds(receipt: any, expectedBins: number[]): number[] {
-        try {
-            // DepositedToBins event signature
-            const depositedEvent = parseAbiItem('event DepositedToBins(address indexed sender, address indexed to, uint256[] ids, bytes32[] amounts)');
+    private async removeLiquidity(bins: number[]) {
+        logger.info('Remove', `Removing from ${bins.length} bins...`);
 
-            for (const log of receipt.logs) {
-                try {
-                    const decoded = decodeEventLog({
-                        abi: [depositedEvent],
-                        data: log.data,
-                        topics: log.topics
-                    });
+        // 1. Check allowances (LBToken is the pool itself)
+        await this.ensureApprove(POOL_ADDRESS, ROUTER_ADDRESS, BigInt(2 ** 256) - 1n); // Lazy approve max if needed
 
-                    if (decoded.eventName === 'DepositedToBins') {
-                        const ids = (decoded.args as any).ids as bigint[];
-                        logger.info('Extract', `📍 Extracted bin IDs from event: [${ids.map(id => Number(id)).join(', ')}]`);
-                        return ids.map(id => Number(id));
-                    }
-                } catch {
-                    // Skip logs that don't match
-                    continue;
-                }
-            }
-
-            // Fallback: use expected bins
-            logger.warn('Extract', `⚠️ Could not extract position IDs from receipt. Using expected bins: [${expectedBins.join(', ')}]`);
-            return expectedBins;
-        } catch (err) {
-            logger.error('Extract', 'Error extracting position IDs:', err);
-            return expectedBins;
-        }
-    }
-
-    private async removeLiquidity(binIds: number[]) {
-        logger.info('Remove', `➖ Removing liquidity from bins [${binIds.join(', ')}]...`);
-        logger.info('Remove', `📊 Pool TokenX: ${this.tokenX} (${this.tokenXSymbol})`);
-        logger.info('Remove', `📊 Pool TokenY: ${this.tokenY} (${this.tokenYSymbol})`);
-        logger.info('Remove', `📊 Is TokenX Native: ${this.isTokenXNative}`);
-
-        // 1. Ensure Router is approved to spend LBPair tokens
-        const isApproved = await this.publicClient.readContract({
-            address: POOL_ADDRESS,
-            abi: PAIR_ABI,
-            functionName: 'isApprovedForAll',
-            args: [this.account.address, ROUTER_ADDRESS]
-        }) as boolean;
-
-        if (!isApproved) {
-            logger.info('Remove', '🔓 Approving Router for LBPair tokens...');
-            await retry(async () => {
-                const { request } = await this.publicClient.simulateContract({
-                    address: POOL_ADDRESS,
-                    abi: PAIR_ABI,
-                    functionName: 'setApprovalForAll',
-                    args: [ROUTER_ADDRESS, true],
-                    account: this.account
-                });
-                const hash = await this.walletClient.writeContract(request);
-                await this.publicClient.waitForTransactionReceipt({ hash });
-                logger.info('Remove', '✅ Router approved for LBPair');
-            }, 3, 2000);
-        }
-
-        // 2. Fetch exact balances to remove
-        const balanceCalls = binIds.map(id => ({
+        // 2. Get balances
+        // ... (implementation same as before, get balances efficiently)
+        const balanceCalls = bins.map(id => ({
             address: POOL_ADDRESS as Address,
             abi: PAIR_ABI,
             functionName: 'balanceOf' as const,
             args: [this.account.address, BigInt(id)] as const
         }));
 
-        const balanceResults = await Promise.allSettled(
-            balanceCalls.map(call => this.publicClient.readContract(call as any))
-        );
+        const results = await Promise.all(balanceCalls.map(c => this.publicClient.readContract(c as any)));
 
-        const idsToRemove: bigint[] = [];
-        const amountsToRemove: bigint[] = [];
+        const ids: bigint[] = [];
+        const amts: bigint[] = [];
 
-        for (let i = 0; i < balanceResults.length; i++) {
-            const result = balanceResults[i];
-            if (result.status === 'fulfilled' && (result.value as bigint) > 0n) {
-                idsToRemove.push(BigInt(binIds[i]));
-                amountsToRemove.push(result.value as bigint);
+        results.forEach((bal, i) => {
+            if ((bal as bigint) > 0n) {
+                ids.push(BigInt(bins[i]));
+                amts.push(bal as bigint);
             }
-        }
+        });
 
-        if (idsToRemove.length === 0) {
-            logger.warn('Remove', '⚠️ No liquidity found to remove.');
-            // CLEAR STATE even if none found, to avoid infinite loop of trying to remove nothing
-            this.activePositions = [];
-            return;
-        }
+        if (ids.length === 0) return;
 
-        logger.info('Remove', `🔥 Removing exact amounts from ${idsToRemove.length} bins: [${amountsToRemove.join(', ')}]`);
+        const nonNativeToken = this.isTokenXNative ? this.tokenY : this.tokenX;
 
-        await retry(async () => {
-            const nonNativeToken = this.isTokenXNative ? this.tokenY : this.tokenX;
-            logger.info('Remove', `🎯 Passing nonNativeToken to router: ${nonNativeToken}`);
+        // 3. Remove
+        const { request } = await this.publicClient.simulateContract({
+            address: ROUTER_ADDRESS,
+            abi: ROUTER_ABI,
+            functionName: 'removeLiquidityNATIVE',
+            args: [
+                nonNativeToken,
+                this.binStep,
+                0n, 0n, // Min amounts
+                ids,
+                amts,
+                this.account.address,
+                BigInt(Math.floor(Date.now() / 1000) + 300)
+            ],
+            account: this.account
+        });
 
-            try {
-                const { request: removeReq } = await this.publicClient.simulateContract({
-                    address: ROUTER_ADDRESS,
-                    abi: ROUTER_ABI,
-                    functionName: 'removeLiquidityNATIVE',
-                    args: [
-                        nonNativeToken,
-                        this.binStep,
-                        0n,
-                        0n,
-                        idsToRemove,
-                        amountsToRemove,
-                        this.account.address,
-                        BigInt(Math.floor(Date.now() / 1000) + 300)
-                    ],
-                    account: this.account
-                });
-
-                const { type, ...requestWithoutType } = removeReq as any;
-                const removeHash = await this.walletClient.writeContract({
-                    ...requestWithoutType,
-                    maxFeePerGas: GAS_SETTINGS.MAX_FEE_PER_GAS,
-                    maxPriorityFeePerGas: GAS_SETTINGS.MAX_PRIORITY_FEE_PER_GAS
-                } as any);
-
-                logger.info('Remove', `📤 TX sent: ${removeHash}`);
-
-                const receipt = await this.publicClient.waitForTransactionReceipt({ hash: removeHash });
-                if (receipt.status === 'reverted') {
-                    throw new Error(`Remove liquidity reverted: ${removeHash}`);
-                }
-
-                logger.info('Remove', `✅ Liquidity removed successfully`);
-
-                // CLEAR STATE ON SUCCESS
-                this.activePositions = [];
-
-            } catch (err: any) {
-                // Try without simulation if it fails
-                const errorMsg = err?.message || '';
-                logger.warn('Remove', `⚠️ Simulation failed: ${errorMsg.slice(0, 100)}... Sending directly...`);
-
-                const removeHash = await this.walletClient.writeContract({
-                    address: ROUTER_ADDRESS,
-                    abi: ROUTER_ABI,
-                    functionName: 'removeLiquidityNATIVE',
-                    args: [
-                        nonNativeToken,
-                        this.binStep,
-                        0n,
-                        0n,
-                        idsToRemove,
-                        amountsToRemove,
-                        this.account.address,
-                        BigInt(Math.floor(Date.now() / 1000) + 300)
-                    ],
-                    maxFeePerGas: GAS_SETTINGS.MAX_FEE_PER_GAS,
-                    maxPriorityFeePerGas: GAS_SETTINGS.MAX_PRIORITY_FEE_PER_GAS
-                } as any);
-
-                const receipt = await this.publicClient.waitForTransactionReceipt({ hash: removeHash });
-                if (receipt.status === 'reverted') {
-                    throw new Error(`Remove liquidity reverted: ${removeHash}`);
-                }
-
-                logger.info('Remove', `✅ Liquidity removed successfully`);
-
-                // CLEAR STATE ON SUCCESS
-                this.activePositions = [];
-            }
-        }, 3, 2000);
+        const hash = await this.walletClient.writeContract(request);
+        logger.info('Remove', `Tx sent: ${hash}`);
+        await this.publicClient.waitForTransactionReceipt({ hash });
     }
 
     private async ensureApprove(token: Address, spender: Address, amount: bigint) {
-        if (amount === 0n) return;
+        if (token === POOL_ADDRESS) {
+            // LBPair verification involves isApprovedForAll
+            const isApproved = await this.publicClient.readContract({
+                address: POOL_ADDRESS,
+                abi: PAIR_ABI,
+                functionName: 'isApprovedForAll',
+                args: [this.account.address, spender]
+            }) as boolean;
+            if (!isApproved) {
+                const { request } = await this.publicClient.simulateContract({
+                    address: POOL_ADDRESS,
+                    abi: PAIR_ABI,
+                    functionName: 'setApprovalForAll',
+                    args: [spender, true],
+                    account: this.account
+                });
+                const hash = await this.walletClient.writeContract(request);
+                await this.publicClient.waitForTransactionReceipt({ hash });
+            }
+            return;
+        }
 
+        // ERC20 verification
         const allowance = await this.publicClient.readContract({
             address: token,
             abi: ERC20_ABI,
             functionName: 'allowance',
             args: [this.account.address, spender]
-        });
+        }) as bigint;
 
-        if (allowance >= amount) {
-            logger.info('Approve', `✅ ${token} already approved`);
-            return;
-        }
-
-        const MAX_UINT256 = 2n ** 256n - 1n;
-        logger.info('Approve', `🔓 Approving ${token}...`);
-
-        await retry(async () => {
+        if (allowance < amount) {
             const { request } = await this.publicClient.simulateContract({
                 address: token,
                 abi: ERC20_ABI,
                 functionName: 'approve',
-                args: [spender, MAX_UINT256],
+                args: [spender, BigInt(2 ** 256) - 1n],
                 account: this.account
             });
             const hash = await this.walletClient.writeContract(request);
             await this.publicClient.waitForTransactionReceipt({ hash });
-            logger.info('Approve', `✅ Approved ${token}`);
-        }, 3, 2000);
+        }
+    }
+
+    // ==================================================
+    // HELPERS
+    // ==================================================
+    private detectBinChurn(activeId: number): boolean {
+        this.lastObservedBins.push(activeId);
+        if (this.lastObservedBins.length > 3) this.lastObservedBins.shift();
+
+        if (this.lastObservedBins.length < 3) return false;
+
+        // [x, x+1, x] or [x+1, x, x+1]
+        const [a, b, c] = this.lastObservedBins;
+        return (a === c && a !== b); // Simple oscillation
+    }
+
+    private checkDailyLimit(): boolean {
+        const today = new Date().getDay();
+        if (today !== this.lastResetDay) {
+            this.dailyRebalanceCount = 0;
+            this.lastResetDay = today;
+        }
+        if (this.dailyRebalanceCount >= STRATEGY.MAX_REBALANCES_PER_DAY) {
+            logger.warn('Safety', 'Daily limit reached. Pausing until tomorrow.');
+            return true;
+        }
+        return false;
+    }
+
+    private async safeShutdown() {
+        if (this.currentBins) {
+            try {
+                await this.removeLiquidity(this.currentBins);
+            } catch (e) {
+                logger.error('Shutdown', 'Failed to clean up positions during shutdown');
+            }
+        }
     }
 }
